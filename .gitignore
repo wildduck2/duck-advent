@@ -1,10 +1,9 @@
+/target/
+Cargo.lock.bak
 node_modules/
-dist/
-bun.lock
-bun.lockb
+.gentleduck/
 *.log
 .DS_Store
 .idea/
 .vscode/
-.tsbuildinfo
 .claude/

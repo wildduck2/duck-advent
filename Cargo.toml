@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = [
+    "advent-core",
+    "advent-cache",
+    "advent-config",
+    "advent-quest",
+    "advent-pty",
+    "advent-tui",
+    "advent-cli",
+]
+default-members = ["advent-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+authors = ["wildduck"]
+repository = "https://github.com/gentleduck/duck-advent"
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.43", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+clap = { version = "4.5", features = ["derive", "wrap_help"] }
+
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+portable-pty = "0.9"
+# Use vt100-ctt (active fork) for terminal emulation; the original `vt100`
+# crate pins old unicode-width that conflicts with modern ratatui.
+vt100-ctt = "0.16"
+
+dirs = "6.0"
+
+sha2 = "0.10"
+hex = "0.4"
+
+chrono = { version = "0.4", features = ["serde"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+
+uuid = { version = "1.11", features = ["v4", "fast-rng"] }
+parking_lot = "0.12"
+futures = "0.3"
+
+advent-core = { path = "advent-core" }
+advent-cache = { path = "advent-cache" }
+advent-config = { path = "advent-config" }
+advent-quest = { path = "advent-quest" }
+advent-pty = { path = "advent-pty" }
+advent-tui = { path = "advent-tui" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
