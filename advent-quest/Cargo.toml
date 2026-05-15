@@ -1,0 +1,11 @@
+[package]
+name = "advent-quest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+advent-core.workspace = true
+tokio = { workspace = true, features = ["process", "fs", "io-util", "time"] }
+anyhow.workspace = true
+tracing.workspace = true
