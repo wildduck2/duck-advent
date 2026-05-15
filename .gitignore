@@ -1,0 +1,10 @@
+node_modules/
+dist/
+bun.lock
+bun.lockb
+*.log
+.DS_Store
+.idea/
+.vscode/
+.tsbuildinfo
+.claude/

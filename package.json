@@ -1,0 +1,68 @@
+{
+  "name": "@gentleduck/advent-code",
+  "version": "0.1.0",
+  "description": "TUI quest runner for Advent-of-Code-style learning projects. Embeds nvim + vitest in a tmux layout.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "duck-advent": "./bin/duck-advent.mjs"
+  },
+  "main": "./src/lib.ts",
+  "types": "./src/lib.ts",
+  "exports": {
+    ".": {
+      "import": "./src/lib.ts",
+      "types": "./src/lib.ts"
+    },
+    "./config": {
+      "import": "./src/config/define.ts",
+      "types": "./src/config/define.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "tmux",
+    "templates",
+    "README.md"
+  ],
+  "scripts": {
+    "dev": "bun run src/cli.ts",
+    "build": "bun run scripts/build.ts",
+    "build:binary": "bun build src/cli.ts --compile --target=bun --outfile dist/duck-advent",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome lint .",
+    "format": "biome format --write .",
+    "check": "biome check --write ."
+  },
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "execa": "^9.5.2",
+    "figlet": "^1.8.0",
+    "ink": "^5.1.0",
+    "ink-big-text": "^2.0.0",
+    "ink-gradient": "^3.0.0",
+    "ink-link": "^4.1.0",
+    "ink-select-input": "^6.0.0",
+    "ink-spinner": "^5.0.0",
+    "ink-text-input": "^6.0.0",
+    "marked": "^15.0.6",
+    "marked-terminal": "^7.2.1",
+    "node-pty": "^1.0.0",
+    "react": "^18.3.1",
+    "react-devtools-core": "^7.0.1",
+    "yargs": "^17.7.2",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.15",
+    "@types/figlet": "^1.7.0",
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.18",
+    "@types/yargs": "^17.0.33",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "bun": ">=1.1.0",
+    "node": ">=22"
+  }
+}
