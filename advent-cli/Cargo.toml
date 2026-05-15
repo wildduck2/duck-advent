@@ -1,0 +1,22 @@
+[package]
+name = "advent-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "duck-advent"
+path = "src/main.rs"
+
+[dependencies]
+advent-core.workspace = true
+advent-cache.workspace = true
+advent-config.workspace = true
+advent-quest.workspace = true
+advent-tui.workspace = true
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
