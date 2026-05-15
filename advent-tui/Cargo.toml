@@ -1,0 +1,20 @@
+[package]
+name = "advent-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+advent-core.workspace = true
+advent-cache.workspace = true
+advent-config.workspace = true
+advent-quest.workspace = true
+advent-pty.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+pulldown-cmark.workspace = true
+futures.workspace = true
