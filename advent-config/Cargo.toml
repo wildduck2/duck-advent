@@ -1,0 +1,16 @@
+[package]
+name = "advent-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+advent-core.workspace = true
+advent-cache.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "fs"] }
+tracing.workspace = true
