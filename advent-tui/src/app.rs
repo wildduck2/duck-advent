@@ -215,6 +215,10 @@ pub struct App {
   /// Body of the active Notice modal (title + message). Cleared on dismiss.
   notice_title: String,
   notice_msg: String,
+  /// Phase to return to when the leaderboard overlay is dismissed. Set by
+  /// every entry point (workspace leader chord, celebrate, briefing) so the
+  /// modal feels stackable instead of teleporting the user.
+  leaderboard_return: Option<Phase>,
 
   /// Wall-clock instant when the current quest session began (last
   /// enter_workspace for this slug). `None` while we are outside a quest
@@ -313,6 +317,7 @@ impl App {
       error_msg: String::new(),
       notice_title: String::new(),
       notice_msg: String::new(),
+      leaderboard_return: None,
       quest_session_start: None,
       session_flushed_secs: 0,
       session_baseline_secs: 0,
@@ -479,12 +484,22 @@ fn notice_keys(app: &mut App, _key: KeyEvent) -> AdventResult<bool> {
 
 fn leaderboard_keys(app: &mut App, key: KeyEvent) -> AdventResult<bool> {
   if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'l' | 'L')) {
-    // Restore the phase the user came from. If the workspace is alive,
-    // that's the natural landing spot; otherwise drop back to whichever
-    // pre-workspace phase had been on screen (briefing or celebrate).
-    app.phase = if app.workspace.is_some() { Phase::Workspace } else { Phase::Celebrate };
+    // Restore the phase the user came from. Falls back to Workspace if no
+    // return was recorded (defensive — shouldn't happen).
+    app.phase = app.leaderboard_return.take().unwrap_or(Phase::Workspace);
   }
   Ok(false)
+}
+
+/// Refresh progress from disk and pop the leaderboard overlay on top of
+/// whichever phase the user invoked it from. `return_to` is restored on
+/// dismiss so the overlay feels stackable (celebrate → board → celebrate,
+/// briefing → board → briefing, etc.).
+fn open_leaderboard(app: &mut App, return_to: Phase) -> AdventResult<()> {
+  app.progress = read_progress(&app.cfg.repo_hash)?;
+  app.leaderboard_return = Some(return_to);
+  app.phase = Phase::Leaderboard;
+  Ok(())
 }
 
 async fn running_keys(app: &mut App, key: KeyEvent) -> AdventResult<bool> {
@@ -542,6 +557,9 @@ async fn briefing_keys(app: &mut App, key: KeyEvent) -> AdventResult<bool> {
     KeyCode::Char('G') => app.briefing_scroll = app.briefing_scroll.saturating_add(200),
     KeyCode::Char(' ') | KeyCode::PageDown => app.briefing_scroll = app.briefing_scroll.saturating_add(10),
     KeyCode::PageUp => app.briefing_scroll = app.briefing_scroll.saturating_sub(10),
+    // Pop the leaderboard right on top of the briefing. Returning closes
+    // the board back into the briefing, not the workspace.
+    KeyCode::Char('l' | 'L') => open_leaderboard(app, Phase::Briefing)?,
     _ => {},
   }
   Ok(false)
@@ -644,12 +662,7 @@ async fn apply_leader_action(app: &mut App, action: LeaderAction) -> AdventResul
         transition_to_quest(app, next.slug.clone(), PendingIntent::GotoNext(next.slug)).await?;
       }
     },
-    LeaderAction::Leaderboard => {
-      // Refresh from disk so the overlay reflects the latest writes (e.g.
-      // a completion that just landed via background tick).
-      app.progress = read_progress(&app.cfg.repo_hash)?;
-      app.phase = Phase::Leaderboard;
-    },
+    LeaderAction::Leaderboard => open_leaderboard(app, Phase::Workspace)?,
     LeaderAction::Cancel | LeaderAction::Unknown => {},
   }
   Ok(false)
@@ -731,6 +744,9 @@ async fn celebrate_keys(app: &mut App, key: KeyEvent) -> AdventResult<bool> {
     KeyCode::Char('r' | 'R') => {
       transition_to_quest(app, app.quest.slug.clone(), PendingIntent::Repeat).await?
     },
+    // Stackable leaderboard. Dismissing the board returns to the celebrate
+    // modal so the user can hit `n` to advance.
+    KeyCode::Char('l' | 'L') => open_leaderboard(app, Phase::Celebrate)?,
     KeyCode::Char('q') | KeyCode::Esc => {
       flush_session_timer(app);
       return Ok(true);
