@@ -37,6 +37,8 @@ use advent_config::LoadedConfig;
 use advent_core::{AdventError, AdventResult, ProgressState, QuestStep};
 use advent_quest::tests::TestOutcome;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+use crate::screens::dirty::DirtyPromptKind;
 use futures::StreamExt;
 use ratatui::layout::Rect;
 use tokio::{sync::oneshot, time};
@@ -86,11 +88,29 @@ enum PendingIntent {
   /// Validate-and-advance (the `<leader> n` happy path, or Enter on the
   /// celebrate screen). Goes to the next quest after the current one.
   AdvanceNext,
-  /// Jump to a specific quest by slug. Used by `<leader> [` and `<leader> ]`.
+  /// Jump to the next quest without validation (`<leader> ]`).
+  GotoNext(String),
+  /// Jump to the previous quest (`<leader> [`).
+  GotoPrev(String),
+  /// Jump to an arbitrary quest by slug (programmatic).
   GotoQuest(String),
   /// Discard edits in the current quest's workdir and re-enter the same
   /// quest. Used by `<leader> r` and the celebrate-screen `r`.
   Repeat,
+}
+
+impl PendingIntent {
+  /// Map the intent to the right DirtyPrompt copy so a backward jump never
+  /// reads "switching to the next quest".
+  fn dirty_kind(&self) -> DirtyPromptKind {
+    match self {
+      PendingIntent::AdvanceNext => DirtyPromptKind::AdvanceForward,
+      PendingIntent::GotoNext(_) => DirtyPromptKind::GoForward,
+      PendingIntent::GotoPrev(_) => DirtyPromptKind::GoBackward,
+      PendingIntent::GotoQuest(_) => DirtyPromptKind::GoForward,
+      PendingIntent::Repeat => DirtyPromptKind::Repeat,
+    }
+  }
 }
 
 /// Pure mapping from a leader-armed keystroke to the action the user means.
@@ -541,12 +561,12 @@ async fn apply_leader_action(app: &mut App, action: LeaderAction) -> AdventResul
     },
     LeaderAction::PrevQuest => {
       if let Some(prev) = app.cfg.config.prev_before(&app.quest.slug).cloned() {
-        transition_to_quest(app, prev.slug.clone(), PendingIntent::GotoQuest(prev.slug)).await?;
+        transition_to_quest(app, prev.slug.clone(), PendingIntent::GotoPrev(prev.slug)).await?;
       }
     },
     LeaderAction::NextQuestNoValidate => {
       if let Some(next) = app.cfg.config.next_after(&app.quest.slug).cloned() {
-        transition_to_quest(app, next.slug.clone(), PendingIntent::GotoQuest(next.slug)).await?;
+        transition_to_quest(app, next.slug.clone(), PendingIntent::GotoNext(next.slug)).await?;
       }
     },
     LeaderAction::Cancel | LeaderAction::Unknown => {},
@@ -890,36 +910,58 @@ async fn advance_after_completion(app: &mut App) -> AdventResult<()> {
 }
 
 /// Apply the user's dirty-tree choice, then replay whatever intent triggered
-/// the prompt. Previously this hard-coded `advance_quest`; now it honours
-/// the intent so backward jumps and repeats don't silently become forward
-/// advances.
+/// the prompt. Previously:
+///   1. hard-coded `advance_quest` — backward `<leader> [` got converted into
+///      a forward jump after the user picked Commit;
+///   2. stash + discard operated only on the quest's workdir, so any edit
+///      outside it (nvim swap, scratch files, cross-cutting fixes) survived
+///      the resolution; the next `working_tree_clean` check failed and we
+///      bounced right back into DirtyPrompt — looking to the user like the
+///      action just lagged or did nothing.
+/// All three resolutions now operate on the FULL working tree, and the post-
+/// resolution path asserts the tree is clean before replaying — if it isn't
+/// (e.g. git refused to stash, weird permissions), we surface a real error
+/// instead of an infinite prompt loop.
 async fn apply_dirty_choice(app: &mut App, choice: DirtyChoice) -> AdventResult<()> {
-  let workdir = app.quest.workdir.clone();
   let repo = app.cfg.repo_root.clone();
-  let msg = format!("complete quest {:02}: {}", app.quest.number, app.quest.title);
+  let msg = format!("duck-advent: snapshot before leaving quest {:02} {}", app.quest.number, app.quest.title);
   app.phase = Phase::Working;
-  app.working_msg = format!("applying: {choice:?}…");
+  app.working_msg = match choice {
+    DirtyChoice::Commit => "committing edits…".into(),
+    DirtyChoice::Stash => "stashing edits…".into(),
+    DirtyChoice::Discard => "discarding edits…".into(),
+  };
   match choice {
     DirtyChoice::Commit => {
-      // Stage EVERYTHING (not just workdir) — otherwise the next
-      // `working_tree_clean` check loops back into the prompt because edits
-      // outside the quest's workdir remain unstaged.
       run_git(&repo, &["add", "-A"]).await?;
-      // `--allow-empty` so `c` succeeds even if every change was inside an
-      // ignored path. `--no-verify` skips pre-commit hooks that would block.
       ensure_git_identity(&repo).await?;
       run_git(&repo, &["commit", "-m", &msg, "--allow-empty", "--no-verify"]).await?;
     },
     DirtyChoice::Stash => {
-      run_git(&repo, &["stash", "push", "-u", "-m", &msg, "--", &workdir]).await?;
+      // `-u` includes untracked. Full tree (no `-- <pathspec>`) so the
+      // resolution actually clears working_tree_clean for the next check.
+      run_git(&repo, &["stash", "push", "-u", "-m", &msg]).await?;
     },
     DirtyChoice::Discard => {
-      advent_quest::git::discard_workdir(&repo, &workdir).await?;
+      // Hard reset to HEAD wipes tracked changes; `clean -fd` removes
+      // untracked files + dirs. Both restricted to the repo root.
+      run_git(&repo, &["reset", "--hard", "HEAD"]).await?;
+      run_git(&repo, &["clean", "-fd"]).await?;
     },
   }
-  // Replay the original intent against the cleaned working tree. If the
-  // intent was lost (shouldn't happen, but defensive), fall back to advancing
-  // forward so the user is never stuck on the Working screen.
+
+  // Loop-guard: if the chosen action did not actually clean the tree (git
+  // refused for some reason — wrong branch, locked index, etc.) we'd
+  // otherwise bounce straight back into DirtyPrompt and look like a lag.
+  // Fail explicitly so the user sees the real cause.
+  if !advent_quest::git::working_tree_clean(&repo).await? {
+    app.pending_intent = None;
+    app.fail(format!("`{choice:?}` did not clean the working tree — run `git status` to inspect"));
+    return Ok(());
+  }
+
+  // Replay the original intent against the cleaned tree. Defensive fallback
+  // to AdvanceNext if the intent vanished (shouldn't happen).
   let intent = app.pending_intent.take().unwrap_or(PendingIntent::AdvanceNext);
   replay_intent(app, intent).await
 }
@@ -937,6 +979,8 @@ async fn replay_intent(app: &mut App, intent: PendingIntent) -> AdventResult<()>
         },
       }
     },
+    PendingIntent::GotoNext(slug) => transition_to_quest(app, slug.clone(), PendingIntent::GotoNext(slug)).await,
+    PendingIntent::GotoPrev(slug) => transition_to_quest(app, slug.clone(), PendingIntent::GotoPrev(slug)).await,
     PendingIntent::GotoQuest(slug) => transition_to_quest(app, slug.clone(), PendingIntent::GotoQuest(slug)).await,
     PendingIntent::Repeat => transition_to_quest(app, app.quest.slug.clone(), PendingIntent::Repeat).await,
   }
@@ -1120,7 +1164,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
           },
         );
       }
-      screens::dirty::draw(frame, area, &app.quest.title);
+      let kind = app.pending_intent.as_ref().map(PendingIntent::dirty_kind).unwrap_or(DirtyPromptKind::AdvanceForward);
+      screens::dirty::draw(frame, area, &app.quest.title, kind);
     },
     Phase::Working => {
       if let Some(ws) = app.workspace.as_ref() {
