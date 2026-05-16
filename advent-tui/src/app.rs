@@ -31,10 +31,11 @@ use std::{
 };
 
 use advent_cache::{
-  ValidatorOutcome, add_elapsed, bump_attempts, bump_hints, complete_quest, read_progress, set_current_quest,
+  CompletionOutcome, ValidatorOutcome, add_elapsed, bump_attempts, bump_hints, complete_quest, read_progress,
+  reset_attempt, set_current_quest,
 };
 use advent_config::LoadedConfig;
-use advent_core::{AdventError, AdventResult, ProgressState, QuestStep};
+use advent_core::{AdventError, AdventResult, ProgressState, QuestManifest, QuestStep};
 use advent_quest::tests::TestOutcome;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -69,6 +70,9 @@ enum Phase {
   HintOverlay,
   Celebrate,
   Complete,
+  /// Read-only overlay listing every quest with best time + status.
+  /// Triggered via `<leader> l`. Dismiss with Esc/Enter/q.
+  Leaderboard,
   Error,
 }
 
@@ -126,6 +130,8 @@ pub enum LeaderAction {
   Quit,
   PrevQuest,
   NextQuestNoValidate,
+  /// Open the per-quest leaderboard overlay.
+  Leaderboard,
   /// Explicit cancel — `c`/`C`/`Esc`. Clears the leader without firing.
   Cancel,
   /// Any other key — leader prefix is consumed but nothing fires.
@@ -143,6 +149,7 @@ pub fn leader_action_for(key: KeyCode) -> LeaderAction {
     KeyCode::Char('h' | 'H') => LeaderAction::Hint,
     KeyCode::Char('p' | 'P') => LeaderAction::Briefing,
     KeyCode::Char('q' | 'Q') => LeaderAction::Quit,
+    KeyCode::Char('l' | 'L') => LeaderAction::Leaderboard,
     KeyCode::Char('[') => LeaderAction::PrevQuest,
     KeyCode::Char(']') => LeaderAction::NextQuestNoValidate,
     KeyCode::Char('c' | 'C') | KeyCode::Esc => LeaderAction::Cancel,
@@ -219,6 +226,19 @@ pub struct App {
   /// `apply_dirty_choice` after the working tree is cleaned. Cleared on
   /// resolution OR cancel so a stale intent never fires later.
   pending_intent: Option<PendingIntent>,
+
+  /// Outcome of the most recent completion. Drives the NEW BEST badge +
+  /// "personal best" line on the celebrate screen. `None` until first solve
+  /// of the session; cleared on quest advance.
+  last_completion: Option<CompletionOutcome>,
+
+  /// Optional repo integrity manifest. When present, every `<leader> n`
+  /// re-hashes the active chapter's test files and refuses to run if
+  /// they drifted; every completion is HMAC-signed with the manifest
+  /// secret so progress.json edits can't forge a solve. `None` means the
+  /// repo hasn't run `duck-advent manifest gen` — best-effort mode, no
+  /// integrity guarantees.
+  manifest: Option<QuestManifest>,
 }
 
 pub async fn run(cfg: LoadedConfig, cli_version: String) -> AdventResult<()> {
@@ -239,7 +259,15 @@ pub async fn run(cfg: LoadedConfig, cli_version: String) -> AdventResult<()> {
 
 impl App {
   fn new(cfg: LoadedConfig, cli_version: String) -> AdventResult<Self> {
-    let progress = read_progress(&cfg.repo_hash)?;
+    let manifest = QuestManifest::load(&cfg.repo_root)?;
+    let mut progress = read_progress(&cfg.repo_hash)?;
+    // Strip any forged or pre-manifest completion entries up front so the
+    // unlock gate, leaderboard, and celebrate screen all see the true state.
+    if let Some(m) = manifest.as_ref() {
+      let _forged = advent_cache::enforce_completion_sigs(&mut progress, &cfg.repo_hash, &m.secret);
+      // Persist the cleaned state so the on-disk view matches what we hold.
+      advent_cache::write_progress(&cfg.repo_hash, &mut progress)?;
+    }
     let is_resume = progress.current_quest.is_some();
     let resume_slug = progress.current_quest.clone().unwrap_or_else(|| cfg.config.first().slug.clone());
     let quest = cfg.config.find_by_slug(&resume_slug).cloned().unwrap_or_else(|| cfg.config.first().clone());
@@ -280,6 +308,8 @@ impl App {
       session_flushed_secs: 0,
       session_baseline_secs: 0,
       pending_intent: None,
+      last_completion: None,
+      manifest,
     })
   }
 
@@ -408,8 +438,19 @@ async fn handle_event(app: &mut App, event: Event) -> AdventResult<bool> {
     Phase::HintOverlay => hint_keys(app, key),
     Phase::Celebrate => celebrate_keys(app, key).await,
     Phase::Complete => Ok(matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q'))),
+    Phase::Leaderboard => leaderboard_keys(app, key),
     Phase::Error => Ok(true),
   }
+}
+
+fn leaderboard_keys(app: &mut App, key: KeyEvent) -> AdventResult<bool> {
+  if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'l' | 'L')) {
+    // Restore the phase the user came from. If the workspace is alive,
+    // that's the natural landing spot; otherwise drop back to whichever
+    // pre-workspace phase had been on screen (briefing or celebrate).
+    app.phase = if app.workspace.is_some() { Phase::Workspace } else { Phase::Celebrate };
+  }
+  Ok(false)
 }
 
 async fn running_keys(app: &mut App, key: KeyEvent) -> AdventResult<bool> {
@@ -568,6 +609,12 @@ async fn apply_leader_action(app: &mut App, action: LeaderAction) -> AdventResul
       if let Some(next) = app.cfg.config.next_after(&app.quest.slug).cloned() {
         transition_to_quest(app, next.slug.clone(), PendingIntent::GotoNext(next.slug)).await?;
       }
+    },
+    LeaderAction::Leaderboard => {
+      // Refresh from disk so the overlay reflects the latest writes (e.g.
+      // a completion that just landed via background tick).
+      app.progress = read_progress(&app.cfg.repo_hash)?;
+      app.phase = Phase::Leaderboard;
     },
     LeaderAction::Cancel | LeaderAction::Unknown => {},
   }
@@ -776,7 +823,28 @@ async fn transition_to_quest(app: &mut App, target_slug: String, intent: Pending
     return Ok(());
   };
 
-  // (2) Branch existence — check BEFORE dirty-prompt. A missing branch is a
+  // (2) Lock gate. A quest is unlocked iff it's the first OR its predecessor
+  // (or the quest itself) is in `progress.completed`. Forward jumps and
+  // explicit "go to slug" actions get gated. Repeat (same quest) and prev
+  // (always going to an earlier — therefore already-unlocked — quest) are
+  // exempt. AdvanceNext fires from the celebrate screen AFTER complete_quest
+  // marked the predecessor done, so it naturally passes.
+  let gate_required = matches!(
+    intent,
+    PendingIntent::AdvanceNext | PendingIntent::GotoNext(_) | PendingIntent::GotoQuest(_)
+  );
+  if gate_required && !app.cfg.config.is_unlocked(&target.slug, &app.progress.completed) {
+    let prev_label = app
+      .cfg
+      .config
+      .prev_before(&target.slug)
+      .map(|p| format!("{:02} ({})", p.number, p.title))
+      .unwrap_or_else(|| "the previous quest".into());
+    app.fail(format!("🔒 Quest {:02} — {} is locked. Complete quest {} first.", target.number, target.title, prev_label));
+    return Ok(());
+  }
+
+  // (3) Branch existence — check BEFORE dirty-prompt. A missing branch is a
   // config/repo bug; popping a dirty prompt for it would be misleading.
   let current_branch = git::current_branch(&app.cfg.repo_root).await?;
   let needs_checkout = current_branch != target.slug;
@@ -791,6 +859,11 @@ async fn transition_to_quest(app: &mut App, target_slug: String, intent: Pending
     match intent {
       PendingIntent::Repeat => {
         flush_session_timer(app);
+        // Wipe the per-attempt clock so this fresh attempt is timed cleanly.
+        // Cumulative `elapsed_seconds` is untouched — the leaderboard's
+        // "total time" view still reflects everything spent here.
+        app.progress = reset_attempt(&app.cfg.repo_hash, &target.slug)?;
+        app.last_completion = None;
         if let Some(ws) = app.workspace.as_mut() {
           ws.editor.kill();
           ws.tests.kill();
@@ -822,6 +895,9 @@ async fn transition_to_quest(app: &mut App, target_slug: String, intent: Pending
   }
   app.progress = set_current_quest(&app.cfg.repo_hash, &target.slug)?;
   app.quest = target.clone();
+  // Quest changed — last completion belongs to the previous quest. Clear it
+  // so a stale NEW BEST badge can't flash on the next celebrate.
+  app.last_completion = None;
   load_briefing(app).await?;
   spawn_workspace(app, target).await?;
   app.pending_intent = None;
@@ -847,6 +923,24 @@ async fn spawn_workspace(app: &mut App, quest: QuestStep) -> AdventResult<()> {
 /// so the UI stays responsive while vitest churns. Live stdout/stderr lines
 /// stream into `test_lines_rx` so the modal can render the tail.
 fn validate_and_celebrate(app: &mut App) -> AdventResult<()> {
+  // Manifest integrity check: when a manifest is present, every test file
+  // recorded for this chapter must still hash to its recorded value. Any
+  // drift means the user edited the spec — refuse to validate so they can't
+  // turn the suite into `it.skip(...)` for a free completion.
+  if let Some(manifest) = app.manifest.as_ref() {
+    let drift = manifest
+      .verify_chapter(&app.cfg.repo_root, &app.quest.slug)
+      .map_err(|e| AdventError::ConfigParse(format!("manifest verify failed: {e}")))?;
+    if !drift.is_empty() {
+      app.fail(format!(
+        "🛑 test file integrity check failed for {} file(s):\n  {}\n\nRestore the originals with `git checkout HEAD -- <path>` or regenerate the manifest with `duck-advent manifest gen` if the change was intentional.",
+        drift.len(),
+        drift.join("\n  ")
+      ));
+      return Ok(());
+    }
+  }
+
   // bump_attempts now returns the full ProgressState — keep our snapshot in
   // sync with disk so the attempt count rendered on the celebrate screen
   // reflects this run, not the previous one.
@@ -887,13 +981,27 @@ async fn on_tests_finished(app: &mut App, outcome: TestOutcome) -> AdventResult<
     app.fail(format!("tests failed:\n{tail}"));
     return Ok(());
   }
-  // Tests passed. Flush any final session seconds BEFORE complete_quest writes
-  // so the celebrate screen reflects the full active time, not just what the
-  // last periodic tick captured.
+  // Tests passed. Flush any final session seconds BEFORE complete_quest
+  // writes so this attempt's `attempt_elapsed_seconds` reflects the full
+  // active time, not just what the last periodic tick captured.
   flush_session_timer(app);
-  app.progress = complete_quest(&app.cfg.repo_hash, &app.quest.slug)?;
+  let secret = app.manifest.as_ref().map(|m| m.secret.as_str());
+  let (state, outcome) = complete_quest(&app.cfg.repo_hash, &app.quest.slug, secret)?;
+  app.progress = state;
+  app.last_completion = Some(outcome);
   app.is_last_quest = app.cfg.config.next_after(&app.quest.slug).is_none();
-  app.celebrate_secs = duration_for(&app.progress, &app.quest.slug);
+  // Prefer the just-recorded attempt time — that's what the user actually
+  // experienced for this solve. Fall back to cumulative for legacy entries.
+  app.celebrate_secs = if outcome.attempt_seconds > 0 {
+    outcome.attempt_seconds
+  } else {
+    duration_for(&app.progress, &app.quest.slug)
+  };
+  // Freeze the live workspace timer — the user is now on the celebrate
+  // modal, not actively working. Any seconds spent looking at the modal
+  // should NOT count toward the cumulative `elapsed_seconds`.
+  app.quest_session_start = None;
+  app.session_flushed_secs = 0;
   app.phase = Phase::Celebrate;
   Ok(())
 }
@@ -1185,6 +1293,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
       screens::working::draw(frame, area, &app.working_msg, (app.test_spin & 0xFF) as u8);
     },
     Phase::Celebrate => {
+      let set_new_best = app.last_completion.map(|o| o.set_new_best).unwrap_or(false);
+      let best_seconds = app
+        .last_completion
+        .and_then(|o| o.best_seconds)
+        .or_else(|| app.progress.quests.get(&app.quest.slug).and_then(|q| q.best_time_seconds));
       let view = screens::celebrate::CelebrateView {
         quest: &app.quest,
         confetti: &app.confetti,
@@ -1192,8 +1305,27 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         attempts: app.attempts_for(&app.quest.slug),
         duration_secs: app.celebrate_secs,
         is_last: app.is_last_quest,
+        set_new_best,
+        best_seconds,
       };
       screens::celebrate::draw(frame, area, &view);
+    },
+    Phase::Leaderboard => {
+      if let Some(ws) = app.workspace.as_ref() {
+        let hints = app.hints_for(&app.quest.slug);
+        ws.draw(
+          frame,
+          area,
+          &crate::workspace::WorkspaceView {
+            quest: &app.quest,
+            total: app.cfg.config.quests.len(),
+            hints_used: hints,
+            leader_pending: app.leader_pending,
+            elapsed_secs: app.quest_elapsed_secs(),
+          },
+        );
+      }
+      screens::leaderboard::draw(frame, area, &app.cfg.config.quests, &app.progress, &app.quest.slug);
     },
     Phase::Complete => {
       let total_dur = (chrono::Utc::now() - app.progress.started_at).num_seconds().max(0) as u64;
@@ -1230,6 +1362,7 @@ mod tests {
     assert_eq!(leader_action_for(KeyCode::Char('h')), LeaderAction::Hint);
     assert_eq!(leader_action_for(KeyCode::Char('p')), LeaderAction::Briefing);
     assert_eq!(leader_action_for(KeyCode::Char('q')), LeaderAction::Quit);
+    assert_eq!(leader_action_for(KeyCode::Char('l')), LeaderAction::Leaderboard);
     assert_eq!(leader_action_for(KeyCode::Char('[')), LeaderAction::PrevQuest);
     assert_eq!(leader_action_for(KeyCode::Char(']')), LeaderAction::NextQuestNoValidate);
     assert_eq!(leader_action_for(KeyCode::Char('c')), LeaderAction::Cancel);
@@ -1238,7 +1371,9 @@ mod tests {
 
   #[test]
   fn leader_action_uppercase_aliases_match_lowercase() {
-    for (lower, upper) in [('n', 'N'), ('r', 'R'), ('b', 'B'), ('z', 'Z'), ('h', 'H'), ('p', 'P'), ('q', 'Q'), ('c', 'C')] {
+    for (lower, upper) in
+      [('n', 'N'), ('r', 'R'), ('b', 'B'), ('z', 'Z'), ('h', 'H'), ('p', 'P'), ('q', 'Q'), ('l', 'L'), ('c', 'C')]
+    {
       assert_eq!(
         leader_action_for(KeyCode::Char(lower)),
         leader_action_for(KeyCode::Char(upper)),

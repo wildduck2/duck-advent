@@ -279,6 +279,8 @@ impl Workspace {
         Span::raw("hint · "),
         Span::styled("p ", Style::default().fg(Color::LightCyan)),
         Span::raw("briefing · "),
+        Span::styled("l ", Style::default().fg(Color::Cyan)),
+        Span::raw("board · "),
         Span::styled("q ", Style::default().fg(Color::Red)),
         Span::raw("quit · "),
         Span::styled("esc ", Style::default().fg(Color::DarkGray)),
