@@ -940,6 +940,18 @@ async fn transition_to_quest(app: &mut App, target_slug: String, intent: Pending
   app.last_completion = None;
   load_briefing(app).await?;
   spawn_workspace(app, target).await?;
+  // After landing in the workspace, pop the briefing overlay automatically
+  // for explicit user-driven cross-quest transitions (advance from celebrate,
+  // <leader> ] / [). The user dismisses with Enter/Esc to start coding.
+  //
+  // Skipped intents:
+  //   - GotoQuest: programmatic — used by the very-first briefing dismiss
+  //     and by Repeat-style same-quest re-enters. Showing the briefing
+  //     again here would loop back into the briefing screen on first run.
+  //   - Repeat: handled in step (3), same quest, no new briefing to read.
+  if matches!(intent, PendingIntent::AdvanceNext | PendingIntent::GotoNext(_) | PendingIntent::GotoPrev(_)) {
+    app.phase = Phase::Briefing;
+  }
   app.pending_intent = None;
   Ok(())
 }
