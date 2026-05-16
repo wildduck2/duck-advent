@@ -15,7 +15,9 @@ pub async fn run(loaded: LoadedConfig) -> Result<()> {
         }
         bail!("tests failed — fix them and try `duck-advent next` again");
       }
-      let _ = advent_cache::complete_quest(&loaded.repo_hash, &current.slug)?;
+      let manifest = advent_core::QuestManifest::load(&loaded.repo_root)?;
+      let secret = manifest.as_ref().map(|m| m.secret.as_str());
+      let (_state, _outcome) = advent_cache::complete_quest(&loaded.repo_hash, &current.slug, secret)?;
       if let Some(next) = loaded.config.next_after(&current.slug) {
         advent_quest::git::checkout(&loaded.repo_root, &next.slug).await?;
         let _ = advent_cache::set_current_quest(&loaded.repo_hash, &next.slug)?;

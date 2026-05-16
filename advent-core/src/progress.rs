@@ -21,11 +21,25 @@ pub struct QuestStats {
   pub hints_used: u32,
   #[serde(default)]
   pub attempts: u32,
-  /// Total seconds the user has actively spent on this quest, summed across
-  /// every TUI session. Persisted so closing and reopening the workspace
-  /// continues the same timer.
+  /// Total seconds spent on this quest, cumulative across attempts + sessions.
+  /// Never resets — `<leader> r` keeps adding to this. Persisted so closing
+  /// and reopening the workspace continues the same cumulative count.
   #[serde(default)]
   pub elapsed_seconds: u64,
+  /// Seconds on the CURRENT attempt only. Resets to 0 on `<leader> r` and
+  /// on successful completion. Drives `best_time_seconds`.
+  #[serde(default)]
+  pub attempt_elapsed_seconds: u64,
+  /// Fastest single-attempt solve time recorded for this quest. `None` until
+  /// first completion. Updated only when a later attempt beats it.
+  #[serde(default)]
+  pub best_time_seconds: Option<u64>,
+  /// HMAC-SHA256 of `"complete:<slug>:<repo_hash>:<completed_at_unix>"` keyed
+  /// by the manifest secret. Set on successful completion; read on load and
+  /// any entry with a missing or mismatched sig is treated as incomplete.
+  /// Hex-encoded.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub completion_sig: Option<String>,
 }
 
 impl ProgressState {

@@ -11,9 +11,10 @@ use std::{
 };
 
 use advent_cache::{
-  ValidatorOutcome, add_elapsed, bump_attempts, bump_hints, complete_quest, has_fresh_install, log_dir,
-  mark_install_complete, progress_path, read_progress, read_validator_cache, repo_hash, root, set_current_quest,
-  set_root_override, write_progress, write_validator_cache,
+  ValidatorOutcome, add_elapsed, bump_attempts, bump_hints, complete_quest, enforce_completion_sigs,
+  has_fresh_install, log_dir, mark_install_complete, progress_path, read_progress, read_validator_cache,
+  repo_hash, reset_attempt, root, set_current_quest, set_root_override, sign_completion, verify_completion,
+  write_progress, write_validator_cache,
 };
 use advent_core::ProgressState;
 use tempfile::TempDir;
@@ -152,12 +153,60 @@ fn complete_quest_marks_and_dedupes() {
   let _sb = CacheSandbox::new();
   let hash = "repo2";
   set_current_quest(hash, "ch1").unwrap();
-  let s1 = complete_quest(hash, "ch1").unwrap();
+  let (s1, _) = complete_quest(hash, "ch1", None).unwrap();
   assert_eq!(s1.completed, vec!["ch1".to_string()]);
   assert!(s1.quests.get("ch1").and_then(|q| q.completed_at).is_some());
   // Idempotent — completing twice does not duplicate in `completed`.
-  let s2 = complete_quest(hash, "ch1").unwrap();
+  let (s2, _) = complete_quest(hash, "ch1", None).unwrap();
   assert_eq!(s2.completed, vec!["ch1".to_string()], "second complete must not duplicate");
+}
+
+#[test]
+fn complete_quest_tracks_best_time_and_resets_attempt() {
+  let _sb = CacheSandbox::new();
+  let hash = "repo-bt";
+  set_current_quest(hash, "ch1").unwrap();
+
+  // First attempt: 30s. complete -> best = 30, attempt reset.
+  add_elapsed(hash, "ch1", 30).unwrap();
+  let (s, o) = complete_quest(hash, "ch1", None).unwrap();
+  assert_eq!(o.attempt_seconds, 30);
+  assert!(o.set_new_best, "first completion always sets best");
+  assert_eq!(o.best_seconds, Some(30));
+  assert_eq!(s.quests.get("ch1").unwrap().best_time_seconds, Some(30));
+  assert_eq!(s.quests.get("ch1").unwrap().attempt_elapsed_seconds, 0, "attempt timer resets on complete");
+  // Cumulative untouched.
+  assert_eq!(s.quests.get("ch1").unwrap().elapsed_seconds, 30);
+
+  // Second attempt: 45s (slower) — best stays 30.
+  add_elapsed(hash, "ch1", 45).unwrap();
+  let (s, o) = complete_quest(hash, "ch1", None).unwrap();
+  assert!(!o.set_new_best);
+  assert_eq!(o.best_seconds, Some(30));
+  assert_eq!(s.quests.get("ch1").unwrap().best_time_seconds, Some(30));
+  // Cumulative now 75.
+  assert_eq!(s.quests.get("ch1").unwrap().elapsed_seconds, 75);
+
+  // Third attempt: 20s — new best.
+  add_elapsed(hash, "ch1", 20).unwrap();
+  let (s, o) = complete_quest(hash, "ch1", None).unwrap();
+  assert!(o.set_new_best);
+  assert_eq!(o.best_seconds, Some(20));
+  assert_eq!(s.quests.get("ch1").unwrap().best_time_seconds, Some(20));
+}
+
+#[test]
+fn reset_attempt_clears_only_attempt_timer() {
+  let _sb = CacheSandbox::new();
+  let hash = "repo-ra";
+  add_elapsed(hash, "ch1", 90).unwrap();
+  let pre = read_progress(hash).unwrap();
+  assert_eq!(pre.quests.get("ch1").unwrap().elapsed_seconds, 90);
+  assert_eq!(pre.quests.get("ch1").unwrap().attempt_elapsed_seconds, 90);
+
+  let after = reset_attempt(hash, "ch1").unwrap();
+  assert_eq!(after.quests.get("ch1").unwrap().elapsed_seconds, 90, "cumulative untouched");
+  assert_eq!(after.quests.get("ch1").unwrap().attempt_elapsed_seconds, 0);
 }
 
 #[test]
@@ -210,4 +259,57 @@ fn write_progress_round_trip_preserves_elapsed_seconds() {
   let back = read_progress(hash).unwrap();
   assert_eq!(back.current_quest.as_deref(), Some("ch1"));
   assert_eq!(back.quests.get("ch1").unwrap().elapsed_seconds, 4242);
+}
+
+#[test]
+fn sign_and_verify_completion_round_trip() {
+  let secret = "deadbeef";
+  let sig = sign_completion(secret, "ch1", "repohash", 1717_000_000);
+  assert!(verify_completion(secret, "ch1", "repohash", 1717_000_000, &sig));
+  // Any field change invalidates.
+  assert!(!verify_completion(secret, "ch2", "repohash", 1717_000_000, &sig));
+  assert!(!verify_completion(secret, "ch1", "otherrepo", 1717_000_000, &sig));
+  assert!(!verify_completion(secret, "ch1", "repohash", 1717_000_001, &sig));
+  assert!(!verify_completion("wrong-secret", "ch1", "repohash", 1717_000_000, &sig));
+}
+
+#[test]
+fn signed_completion_round_trips_through_cache() {
+  let _sb = CacheSandbox::new();
+  let hash = "repo-sig";
+  let secret = "s3cret";
+  set_current_quest(hash, "ch1").unwrap();
+  add_elapsed(hash, "ch1", 10).unwrap();
+  let (state, _) = complete_quest(hash, "ch1", Some(secret)).unwrap();
+  let sig = state.quests.get("ch1").unwrap().completion_sig.clone().expect("sig set");
+  let ts = state.quests.get("ch1").unwrap().completed_at.unwrap().timestamp();
+  assert!(verify_completion(secret, "ch1", hash, ts, &sig));
+}
+
+#[test]
+fn enforce_completion_sigs_drops_forged_entries() {
+  let _sb = CacheSandbox::new();
+  let hash = "repo-forge";
+  let secret = "real";
+  // Legit completion.
+  set_current_quest(hash, "ch1").unwrap();
+  add_elapsed(hash, "ch1", 5).unwrap();
+  let (mut state, _) = complete_quest(hash, "ch1", Some(secret)).unwrap();
+
+  // Forged: add ch2 to completed with a fake sig.
+  state.completed.push("ch2".to_string());
+  let q = state.ensure_quest("ch2");
+  q.completed_at = Some(chrono::Utc::now());
+  q.completion_sig = Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into());
+  // Also forge ch3 with no sig at all (pre-manifest style edit).
+  state.completed.push("ch3".to_string());
+  state.ensure_quest("ch3").completed_at = Some(chrono::Utc::now());
+
+  let forged = enforce_completion_sigs(&mut state, hash, secret);
+  assert!(forged.contains(&"ch2".to_string()));
+  assert!(forged.contains(&"ch3".to_string()));
+  assert!(!forged.contains(&"ch1".to_string()), "honest completion stays");
+  assert_eq!(state.completed, vec!["ch1".to_string()]);
+  assert!(state.quests.get("ch2").unwrap().completed_at.is_none());
+  assert!(state.quests.get("ch3").unwrap().completed_at.is_none());
 }
