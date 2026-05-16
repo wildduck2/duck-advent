@@ -170,12 +170,13 @@ impl Workspace {
     total: usize,
     hints_used: u32,
     leader_pending: bool,
+    elapsed_secs: u64,
   ) {
     let chunks = Layout::default()
       .direction(Direction::Vertical)
       .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
       .split(area);
-    self.draw_status(frame, chunks[0], quest, total, hints_used, leader_pending);
+    self.draw_status(frame, chunks[0], quest, total, hints_used, leader_pending, elapsed_secs);
     self.draw_panes(frame, chunks[1]);
     self.draw_hints(frame, chunks[2], leader_pending);
   }
@@ -188,6 +189,7 @@ impl Workspace {
     total: usize,
     hints: u32,
     leader_pending: bool,
+    elapsed_secs: u64,
   ) {
     let mut spans = vec![
       Span::styled("  duck ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -202,6 +204,8 @@ impl Workspace {
       Span::styled(quest.tier.clone().unwrap_or_default(), Style::default().fg(Color::DarkGray)),
       Span::raw("  · hints "),
       Span::styled(format!("{}/{}", hints, quest.hints.len()), Style::default().fg(Color::Yellow)),
+      Span::raw("  · "),
+      Span::styled(format_elapsed(elapsed_secs), Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
     ];
     if leader_pending {
       spans.push(Span::raw("  "));
@@ -272,6 +276,10 @@ impl Workspace {
         Span::raw("repeat · "),
         Span::styled("b ", Style::default().fg(Color::Cyan)),
         Span::raw("switch · "),
+        Span::styled("[ ", Style::default().fg(Color::Blue)),
+        Span::raw("prev · "),
+        Span::styled("] ", Style::default().fg(Color::Blue)),
+        Span::raw("next · "),
         Span::styled("z ", Style::default().fg(Color::Magenta)),
         Span::raw("zoom · "),
         Span::styled("h ", Style::default().fg(Color::Yellow)),
@@ -301,6 +309,15 @@ impl Workspace {
     };
     frame.render_widget(Paragraph::new(line), area);
   }
+}
+
+/// Format a quest timer. Uses `mm:ss` under one hour and `h:mm:ss` above so
+/// the status bar stays narrow on short quests but never truncates on long ones.
+fn format_elapsed(total_secs: u64) -> String {
+  let h = total_secs / 3600;
+  let m = (total_secs % 3600) / 60;
+  let s = total_secs % 60;
+  if h > 0 { format!("⏱ {h}:{m:02}:{s:02}") } else { format!("⏱ {m:02}:{s:02}") }
 }
 
 fn split(area: Rect) -> (Rect, Rect) {

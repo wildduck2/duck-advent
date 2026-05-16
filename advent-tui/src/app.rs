@@ -1,9 +1,14 @@
 //! Finite-state TUI driver. Phase transitions are explicit; all I/O happens
 //! through awaited helpers so the render loop never blocks.
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+  path::PathBuf,
+  time::{Duration, Instant},
+};
 
-use advent_cache::{ValidatorOutcome, bump_attempts, bump_hints, complete_quest, read_progress, set_current_quest};
+use advent_cache::{
+  ValidatorOutcome, add_elapsed, bump_attempts, bump_hints, complete_quest, read_progress, set_current_quest,
+};
 use advent_config::LoadedConfig;
 use advent_core::{AdventError, AdventResult, ProgressState, QuestStep};
 use advent_quest::tests::TestOutcome;
@@ -100,6 +105,19 @@ pub struct App {
   working_msg: String,
 
   error_msg: String,
+
+  /// Wall-clock instant when the current quest session began (last
+  /// enter_workspace for this slug). `None` while we are outside a quest
+  /// workspace (splash, install, validating, briefing-before-first-enter).
+  quest_session_start: Option<Instant>,
+  /// Whole seconds of the current session that have already been flushed to
+  /// `~/.gentleduck/state/.../progress.json`. The delta between this and
+  /// `quest_session_start.elapsed().as_secs()` is what the next flush adds.
+  session_flushed_secs: u64,
+  /// Cached `elapsed_seconds` from progress.json at the start of this session,
+  /// so the live timer = `session_baseline + session_start.elapsed()` without
+  /// hitting disk on every render.
+  session_baseline_secs: u64,
 }
 
 pub async fn run(cfg: LoadedConfig, cli_version: String) -> AdventResult<()> {
@@ -112,6 +130,8 @@ pub async fn run(cfg: LoadedConfig, cli_version: String) -> AdventResult<()> {
     Ok(()) => main_loop(&mut terminal, &mut app).await,
     Err(e) => Err(e),
   };
+  // Final flush so the last few seconds of the session are not lost on quit.
+  flush_session_timer(&mut app);
   leave(&mut terminal).ok();
   result
 }
@@ -155,7 +175,17 @@ impl App {
       tick_count: 0,
       working_msg: String::new(),
       error_msg: String::new(),
+      quest_session_start: None,
+      session_flushed_secs: 0,
+      session_baseline_secs: 0,
     })
+  }
+
+  /// Live elapsed for the current quest = persisted baseline + current
+  /// session. Returns 0 when there is no quest session active (e.g. splash).
+  pub fn quest_elapsed_secs(&self) -> u64 {
+    let session = self.quest_session_start.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+    self.session_baseline_secs.saturating_add(session)
   }
 
   fn fail(&mut self, msg: impl Into<String>) {
@@ -203,6 +233,11 @@ async fn on_tick(app: &mut App) -> AdventResult<()> {
   }
   if matches!(app.phase, Phase::Celebrate | Phase::Complete) {
     app.confetti.tick();
+  }
+  // Flush the per-quest timer to disk every ~5 s so a SIGKILL only loses a
+  // handful of seconds. Tick is 40 ms, so 125 ticks ≈ 5 s.
+  if app.tick_count.is_multiple_of(125) {
+    flush_session_timer(app);
   }
   if matches!(app.phase, Phase::RunningTests) {
     app.test_spin = app.test_spin.wrapping_add(1);
@@ -427,6 +462,19 @@ async fn dispatch_leader(app: &mut App, key: KeyEvent) -> AdventResult<bool> {
       app.phase = Phase::Briefing;
     },
     KeyCode::Char('q' | 'Q') => return Ok(true),
+    // `[` / `]` — non-destructive quest navigation. No validation, just jump.
+    // Mirrors vim's `[`/`]` motions. Dirty tree pops the same prompt the
+    // forward path uses.
+    KeyCode::Char('[') => {
+      if let Some(prev) = app.cfg.config.prev_before(&app.quest.slug).cloned() {
+        goto_quest(app, prev.slug).await?;
+      }
+    },
+    KeyCode::Char(']') => {
+      if let Some(next) = app.cfg.config.next_after(&app.quest.slug).cloned() {
+        goto_quest(app, next.slug).await?;
+      }
+    },
     // c / Esc / Ctrl-a again = cancel the leader without firing a command.
     KeyCode::Char('c' | 'C') | KeyCode::Esc => {},
     _ => {},
@@ -626,6 +674,7 @@ async fn enter_workspace(app: &mut App) -> AdventResult<()> {
   let ws = Workspace::spawn(&app.cfg.repo_root, &app.cfg.config, &app.quest, area)
     .map_err(|e| AdventError::Git(e.to_string()))?;
   app.workspace = Some(ws);
+  begin_quest_session(app);
   app.phase = Phase::Workspace;
   Ok(())
 }
@@ -689,6 +738,7 @@ async fn advance_quest(app: &mut App) -> AdventResult<()> {
     app.phase = Phase::DirtyPrompt;
     return Ok(());
   }
+  flush_session_timer(app);
   drop(app.workspace.take());
   app.quest = next;
   load_briefing(app).await?;
@@ -751,6 +801,57 @@ async fn ensure_git_identity(cwd: &std::path::Path) -> AdventResult<()> {
   Ok(())
 }
 
+/// Persist the unflushed delta of the current quest session and slide the
+/// flush watermark forward. Safe to call when no session is active.
+fn flush_session_timer(app: &mut App) {
+  let Some(started) = app.quest_session_start else {
+    return;
+  };
+  let session_secs = started.elapsed().as_secs();
+  let delta = session_secs.saturating_sub(app.session_flushed_secs);
+  if delta == 0 {
+    return;
+  }
+  if let Ok(total) = add_elapsed(&app.cfg.repo_hash, &app.quest.slug, delta) {
+    app.session_flushed_secs = session_secs;
+    if let Some(q) = app.progress.quests.get_mut(&app.quest.slug) {
+      q.elapsed_seconds = total;
+    }
+  }
+}
+
+/// Snapshot the persisted elapsed_seconds for the current quest and start a
+/// fresh session clock. Called every time we land in the workspace on a new
+/// quest so the live timer continues from where the user left off.
+fn begin_quest_session(app: &mut App) {
+  app.session_baseline_secs = app.progress.quests.get(&app.quest.slug).map(|q| q.elapsed_seconds).unwrap_or(0);
+  app.session_flushed_secs = 0;
+  app.quest_session_start = Some(Instant::now());
+}
+
+/// Switch to a quest by slug without running the validator. Flushes the
+/// in-flight timer so the move never robs the user of recorded time. Used by
+/// the `<leader> [` / `<leader> ]` chords.
+async fn goto_quest(app: &mut App, slug: String) -> AdventResult<()> {
+  let Some(target) = app.cfg.config.find_by_slug(&slug).cloned() else {
+    app.fail(format!("quest {slug} not in config"));
+    return Ok(());
+  };
+  if target.slug == app.quest.slug {
+    return Ok(());
+  }
+  if !advent_quest::git::working_tree_clean(&app.cfg.repo_root).await? {
+    app.phase = Phase::DirtyPrompt;
+    return Ok(());
+  }
+  flush_session_timer(app);
+  drop(app.workspace.take());
+  app.quest = target;
+  load_briefing(app).await?;
+  enter_workspace(app).await?;
+  Ok(())
+}
+
 async fn repeat_current(app: &mut App) -> AdventResult<()> {
   let workdir = app.quest.workdir.clone();
   if let Some(ws) = app.workspace.as_mut() {
@@ -767,6 +868,12 @@ fn duration_for(progress: &ProgressState, slug: &str) -> u64 {
   let Some(q) = progress.quests.get(slug) else {
     return 0;
   };
+  // Prefer the active-time accumulator (skips idle/closed-laptop time). Fall
+  // back to wall-clock between start and completion for legacy progress files
+  // written before `elapsed_seconds` existed.
+  if q.elapsed_seconds > 0 {
+    return q.elapsed_seconds;
+  }
   let Some(start) = q.started_at else {
     return 0;
   };
@@ -793,27 +900,27 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
       // pane keep running while they read the briefing.
       if let Some(ws) = app.workspace.as_ref() {
         let hints = app.hints_for(&app.quest.slug);
-        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending);
+        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending, app.quest_elapsed_secs());
       }
       screens::briefing::draw(frame, area, &app.quest, &app.briefing_md, app.briefing_scroll);
     },
     Phase::Workspace => {
       if let Some(ws) = app.workspace.as_ref() {
         let hints = app.hints_for(&app.quest.slug);
-        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending);
+        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending, app.quest_elapsed_secs());
       }
     },
     Phase::HintOverlay => {
       if let Some(ws) = app.workspace.as_ref() {
         let hints = app.hints_for(&app.quest.slug);
-        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending);
+        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending, app.quest_elapsed_secs());
       }
       screens::hint::draw(frame, area, &app.hint_text, app.hint_index, app.quest.hints.len());
     },
     Phase::RunningTests => {
       if let Some(ws) = app.workspace.as_ref() {
         let hints = app.hints_for(&app.quest.slug);
-        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending);
+        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending, app.quest_elapsed_secs());
       }
       let elapsed_ticks = app.tick_count.wrapping_sub(app.test_started_tick);
       let tail: Vec<&str> = app.test_tail.iter().map(String::as_str).collect();
@@ -829,14 +936,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     Phase::DirtyPrompt => {
       if let Some(ws) = app.workspace.as_ref() {
         let hints = app.hints_for(&app.quest.slug);
-        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending);
+        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending, app.quest_elapsed_secs());
       }
       screens::dirty::draw(frame, area, &app.quest.title);
     },
     Phase::Working => {
       if let Some(ws) = app.workspace.as_ref() {
         let hints = app.hints_for(&app.quest.slug);
-        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending);
+        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending, app.quest_elapsed_secs());
       }
       screens::working::draw(frame, area, &app.working_msg, (app.test_spin & 0xFF) as u8);
     },
