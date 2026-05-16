@@ -1,8 +1,9 @@
-use crate::Cmd;
+use crate::{Cmd, ManifestCmd};
 use anyhow::Result;
 
 mod doctor;
 mod init;
+mod manifest;
 mod next;
 mod open;
 mod prev;
@@ -24,6 +25,10 @@ pub async fn dispatch(cmd: Cmd, version: &str) -> Result<()> {
     Cmd::Status => status::run(loaded).await,
     Cmd::Doctor => doctor::run(loaded).await,
     Cmd::Repeat => repeat::run(loaded).await,
+    Cmd::Manifest(sub) => match sub {
+      ManifestCmd::Gen => manifest::run_gen(loaded).await,
+      ManifestCmd::Verify => manifest::run_verify(loaded).await,
+    },
     Cmd::Init => unreachable!("handled above"),
   }
 }

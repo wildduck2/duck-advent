@@ -28,6 +28,18 @@ enum Cmd {
   Repeat,
   /// Scaffold a quest.config.ts in the current directory.
   Init,
+  /// Manage the repo integrity manifest (`.duck-manifest.json`).
+  #[command(subcommand)]
+  Manifest(ManifestCmd),
+}
+
+#[derive(Subcommand)]
+pub enum ManifestCmd {
+  /// (Re)generate the manifest by scanning test files on the current branch.
+  /// Run this whenever you intentionally change test contents.
+  Gen,
+  /// Verify the active chapter's test files still match the manifest hashes.
+  Verify,
 }
 
 #[tokio::main]
