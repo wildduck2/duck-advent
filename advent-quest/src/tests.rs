@@ -23,8 +23,35 @@ pub struct TestOutcome {
 }
 
 /// Hard upper bound on how long a one-shot validation may take. Vitest cold
-/// starts can be 30s; we give comfortable headroom but bail on a true hang.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
+/// starts are ~10s; chapters with blocking commands (BLPOP/BRPOP/BLMOVE) can
+/// stack up to ~30s per failing test. 60s covers honest runs without letting
+/// a hanging worker burn minutes of the user's life.
+///
+/// Override at runtime with `DUCK_TEST_TIMEOUT_SECS=<n>` for chapters that
+/// genuinely need longer (large streaming benchmarks, cluster MEET dances).
+const DEFAULT_TIMEOUT_SECS: u64 = 60;
+
+fn resolve_timeout() -> Duration {
+  let secs = std::env::var("DUCK_TEST_TIMEOUT_SECS")
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok())
+    .filter(|n| *n > 0)
+    .unwrap_or(DEFAULT_TIMEOUT_SECS);
+  Duration::from_secs(secs)
+}
+
+/// Per-test soft cap passed to vitest via `--testTimeout` and `--hookTimeout`.
+/// Stops a single hung test from chewing the full 30s default × N tests.
+/// Override with `DUCK_PER_TEST_TIMEOUT_MS=<n>`.
+const DEFAULT_PER_TEST_TIMEOUT_MS: u64 = 10_000;
+
+fn resolve_per_test_timeout_ms() -> u64 {
+  std::env::var("DUCK_PER_TEST_TIMEOUT_MS")
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok())
+    .filter(|n| *n > 0)
+    .unwrap_or(DEFAULT_PER_TEST_TIMEOUT_MS)
+}
 
 /// Build the argv for a one-shot validation run.
 ///
@@ -33,6 +60,12 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 /// * forces vitest into run mode with `--run` when the binary is vitest and
 ///   no run flag is already present — vitest defaults to watch mode in TTYs
 ///   and hangs when invoked without `--run`.
+/// * injects `--testTimeout` and `--hookTimeout` so a single hanging test
+///   can't stack up to multiple minutes. The repo's `vitest.config.ts`
+///   default of 30s is generous; for chapters that depend on blocking
+///   commands (BLPOP, BLMOVE) a TODO stub stacking 6×30s would wait three
+///   minutes per `<leader> n`. Capping at 10s per test keeps the worst-case
+///   suite under a minute.
 pub fn one_shot_argv(config: &QuestConfig, quest: &QuestStep) -> Vec<String> {
   let mut argv: Vec<String> =
     config.test_command.iter().filter(|a| !matches!(a.as_str(), "--watch" | "-w")).cloned().collect();
@@ -48,6 +81,15 @@ pub fn one_shot_argv(config: &QuestConfig, quest: &QuestStep) -> Vec<String> {
     // being interpreted as patterns.
     let pos = argv.iter().position(|a| a == "vitest" || a.ends_with("/vitest")).unwrap_or(0) + 1;
     argv.insert(pos, "--run".to_string());
+  }
+  if is_vitest {
+    let ms = resolve_per_test_timeout_ms();
+    if !argv.iter().any(|a| a.starts_with("--testTimeout")) {
+      argv.push(format!("--testTimeout={ms}"));
+    }
+    if !argv.iter().any(|a| a.starts_with("--hookTimeout")) {
+      argv.push(format!("--hookTimeout={ms}"));
+    }
   }
   argv
 }
@@ -112,7 +154,7 @@ pub async fn run_streaming(
     }
   });
 
-  let wait_result = timeout(DEFAULT_TIMEOUT, child.wait()).await;
+  let wait_result = timeout(resolve_timeout(), child.wait()).await;
   let _ = stdout_task.await;
   let _ = stderr_task.await;
   kill_task.abort();

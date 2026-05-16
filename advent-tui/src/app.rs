@@ -1043,7 +1043,17 @@ async fn on_tests_finished(app: &mut App, outcome: TestOutcome) -> AdventResult<
     return Ok(());
   }
   if outcome.timed_out {
-    app.fail("tests timed out after 3 minutes — check the runner config".to_string());
+    let secs = std::env::var("DUCK_TEST_TIMEOUT_SECS")
+      .ok()
+      .and_then(|s| s.parse::<u64>().ok())
+      .filter(|n| *n > 0)
+      .unwrap_or(60);
+    app.notice(
+      "Tests timed out",
+      format!(
+        "⏱  Vitest didn't finish within {secs}s.\n\nLikely cause: a TODO worker stubbed out a blocking call (BLPOP / BLMOVE / XREAD), so a test waited for an event that never came.\n\nFix: implement the worker, OR raise the budget with DUCK_TEST_TIMEOUT_SECS=<n> (suite) / DUCK_PER_TEST_TIMEOUT_MS=<n> (per test) before re-running."
+      ),
+    );
     return Ok(());
   }
   if !outcome.passed {
