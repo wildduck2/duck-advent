@@ -19,9 +19,7 @@ pub struct QuestConfig {
   pub validators: Vec<ValidatorSpec>,
   #[serde(default)]
   pub services: BTreeMap<String, ServiceSpec>,
-  /// Accept either `quests` (preferred) or `chapters` (legacy). The bun
-  /// bridge normalizes both into this field before serializing.
-  #[serde(alias = "chapters")]
+  /// Ordered list of quests the user walks through.
   pub quests: Vec<QuestStep>,
 }
 
@@ -96,6 +94,31 @@ impl QuestConfig {
   pub fn prev_before(&self, slug: &str) -> Option<&QuestStep> {
     let idx = self.quests.iter().position(|q| q.slug == slug)?;
     if idx == 0 { None } else { self.quests.get(idx - 1) }
+  }
+
+  /// Whether quest `slug` is reachable given the set of already-completed
+  /// quest slugs. A quest is unlocked when:
+  ///   - it is the first quest (no predecessor), OR
+  ///   - its IMMEDIATE predecessor (by config order) is in `completed`, OR
+  ///   - the quest itself is already completed (so previously-finished quests
+  ///     stay reachable for review even if the user wipes nothing in
+  ///     between).
+  ///
+  /// Returns `true` for unknown slugs — callers should resolve the slug first
+  /// before relying on the lock semantics; an unknown slug failure is handled
+  /// separately upstream.
+  pub fn is_unlocked(&self, slug: &str, completed: &[String]) -> bool {
+    let Some(idx) = self.quests.iter().position(|q| q.slug == slug) else {
+      return true;
+    };
+    if idx == 0 {
+      return true;
+    }
+    if completed.iter().any(|s| s == slug) {
+      return true;
+    }
+    let prev_slug = &self.quests[idx - 1].slug;
+    completed.iter().any(|s| s == prev_slug)
   }
 }
 
@@ -173,5 +196,27 @@ mod tests {
     assert_eq!(c.first().slug, "only");
     assert!(c.next_after("only").is_none());
     assert!(c.prev_before("only").is_none());
+  }
+
+  #[test]
+  fn unlock_first_quest_always_open() {
+    let c = config(&["a", "b", "c"]);
+    assert!(c.is_unlocked("a", &[]));
+  }
+
+  #[test]
+  fn unlock_requires_predecessor_completed() {
+    let c = config(&["a", "b", "c"]);
+    assert!(!c.is_unlocked("b", &[]), "b locked while a incomplete");
+    assert!(!c.is_unlocked("c", &["a".into()]), "c locked while b incomplete");
+    assert!(c.is_unlocked("b", &["a".into()]));
+    assert!(c.is_unlocked("c", &["a".into(), "b".into()]));
+  }
+
+  #[test]
+  fn unlock_already_completed_quest_stays_open() {
+    let c = config(&["a", "b", "c"]);
+    // User completed b somehow then wiped its predecessor — b stays unlocked.
+    assert!(c.is_unlocked("b", &["b".into()]));
   }
 }

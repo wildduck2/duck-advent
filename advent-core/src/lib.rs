@@ -6,8 +6,10 @@
 
 pub mod config;
 pub mod error;
+pub mod manifest;
 pub mod progress;
 
 pub use config::{QuestConfig, QuestStep, ServiceSpec, ValidatorSpec};
 pub use error::{AdventError, AdventResult};
+pub use manifest::{ChapterManifest, MANIFEST_FILENAME, QuestManifest, derive_secret, file_hash};
 pub use progress::{ProgressState, QuestStats};
