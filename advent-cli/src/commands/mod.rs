@@ -5,6 +5,7 @@ mod doctor;
 mod init;
 mod next;
 mod open;
+mod prev;
 mod repeat;
 mod status;
 
@@ -19,6 +20,7 @@ pub async fn dispatch(cmd: Cmd, version: &str) -> Result<()> {
   match cmd {
     Cmd::Open => open::run(loaded, version).await,
     Cmd::Next => next::run(loaded).await,
+    Cmd::Prev => prev::run(loaded).await,
     Cmd::Status => status::run(loaded).await,
     Cmd::Doctor => doctor::run(loaded).await,
     Cmd::Repeat => repeat::run(loaded).await,

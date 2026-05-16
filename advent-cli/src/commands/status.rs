@@ -18,9 +18,20 @@ pub async fn run(loaded: LoadedConfig) -> Result<()> {
     }
     let used = progress.quests.get(&q.slug).map(|s| s.hints_used).unwrap_or(0);
     println!("hints:     {used}/{}", q.hints.len());
+    let elapsed = progress.quests.get(&q.slug).map(|s| s.elapsed_seconds).unwrap_or(0);
+    println!("time:      {}", fmt_elapsed(elapsed));
   } else {
     println!("quest:     (not on a recognized quest branch — run `duck-advent` to begin)");
   }
   println!("completed: {}/{}", progress.completed.len(), total);
+  let journey_secs: u64 = progress.quests.values().map(|q| q.elapsed_seconds).sum();
+  println!("journey time: {}", fmt_elapsed(journey_secs));
   Ok(())
+}
+
+fn fmt_elapsed(total_secs: u64) -> String {
+  let h = total_secs / 3600;
+  let m = (total_secs % 3600) / 60;
+  let s = total_secs % 60;
+  if h > 0 { format!("{h}h {m:02}m {s:02}s") } else { format!("{m:02}m {s:02}s") }
 }

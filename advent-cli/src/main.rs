@@ -18,6 +18,8 @@ enum Cmd {
   Open,
   /// Validate tests pass, then advance to the next quest.
   Next,
+  /// Switch back to the previous quest (no test gate).
+  Prev,
   /// Print current journey state.
   Status,
   /// Run all validators (bypass cache).
