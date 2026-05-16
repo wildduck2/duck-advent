@@ -39,6 +39,7 @@ export namespace Duck {
   export type IQuestConfig = types.IQuestConfig;
   export type IQuestStep = types.IQuestStep;
   export type IValidator = types.IValidator;
+  export type IServiceSpec = types.IServiceSpec;
   export type IPackageManager = types.IPackageManager;
   export type IDifficulty = types.IDifficulty;
 
@@ -55,5 +56,5 @@ export function defineConfig(config: Duck.IQuestConfig): Duck.IQuestConfig {
   return config;
 }
 
-export type { IQuestConfig, IQuestStep, IValidator, IPackageManager, IDifficulty } from "./types";
+export type { IQuestConfig, IQuestStep, IValidator, IServiceSpec, IPackageManager, IDifficulty } from "./types";
 export { CONSTANTS } from "./constants";

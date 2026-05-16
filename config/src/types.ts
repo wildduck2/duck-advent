@@ -18,6 +18,15 @@ export interface IValidator {
   readonly optional?: boolean;
 }
 
+export interface IServiceSpec {
+  /** Path (repo-relative) to a docker compose file that brings the service up. */
+  readonly compose: string;
+  /** Container name the spec declares — used for health probes and shutdown. */
+  readonly container: string;
+  /** Optional argv duck-advent runs to confirm the service is reachable. */
+  readonly readyCheck?: readonly string[];
+}
+
 export interface IQuestStep {
   /** 1-based ordinal in the journey. */
   readonly number: number;
@@ -35,6 +44,10 @@ export interface IQuestStep {
   readonly workdir: string;
   /** Substring passed to the test runner to scope what runs. */
   readonly testFilter?: string;
+  /** Names of top-level `services` entries this quest depends on. */
+  readonly services?: readonly string[];
+  /** Optional path to a seed script duck-advent runs before the quest starts. */
+  readonly seed?: string;
   /** Hints surfaced one-by-one in the workspace via ⌃h. */
   readonly hints?: readonly string[];
 }
@@ -57,6 +70,8 @@ export interface IQuestConfig {
   readonly cacheDir?: typeof CONSTANTS.DEFAULT_CACHE_DIR | string;
   /** Environment checks run on first launch and again with `duck-advent doctor`. */
   readonly validators?: readonly IValidator[];
+  /** Service specs the quests may depend on (per-quest `services: [...]`). */
+  readonly services?: Readonly<Record<string, IServiceSpec>>;
   /** Ordered list of quests. */
   readonly quests: readonly IQuestStep[];
 }
