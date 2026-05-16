@@ -21,6 +21,11 @@ pub struct QuestStats {
   pub hints_used: u32,
   #[serde(default)]
   pub attempts: u32,
+  /// Total seconds the user has actively spent on this quest, summed across
+  /// every TUI session. Persisted so closing and reopening the workspace
+  /// continues the same timer.
+  #[serde(default)]
+  pub elapsed_seconds: u64,
 }
 
 impl ProgressState {

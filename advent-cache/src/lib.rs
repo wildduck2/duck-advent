@@ -191,3 +191,19 @@ pub fn bump_attempts(repo_hash: &str, slug: &str) -> AdventResult<u32> {
   write_progress(repo_hash, &mut state)?;
   Ok(n)
 }
+
+/// Add `secs` to the per-quest elapsed timer and persist. Returns the new
+/// total. Called on a periodic tick from the TUI so the timer survives
+/// SIGKILL / lid-close with at most a few seconds of drift.
+pub fn add_elapsed(repo_hash: &str, slug: &str, secs: u64) -> AdventResult<u64> {
+  if secs == 0 {
+    let state = read_progress(repo_hash)?;
+    return Ok(state.quests.get(slug).map(|q| q.elapsed_seconds).unwrap_or(0));
+  }
+  let mut state = read_progress(repo_hash)?;
+  let q = state.ensure_quest(slug);
+  q.elapsed_seconds = q.elapsed_seconds.saturating_add(secs);
+  let total = q.elapsed_seconds;
+  write_progress(repo_hash, &mut state)?;
+  Ok(total)
+}

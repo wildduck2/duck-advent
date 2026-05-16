@@ -92,4 +92,9 @@ impl QuestConfig {
     let idx = self.quests.iter().position(|q| q.slug == slug)?;
     self.quests.get(idx + 1)
   }
+
+  pub fn prev_before(&self, slug: &str) -> Option<&QuestStep> {
+    let idx = self.quests.iter().position(|q| q.slug == slug)?;
+    if idx == 0 { None } else { self.quests.get(idx - 1) }
+  }
 }
