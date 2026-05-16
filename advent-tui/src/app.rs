@@ -73,6 +73,10 @@ enum Phase {
   /// Read-only overlay listing every quest with best time + status.
   /// Triggered via `<leader> l`. Dismiss with Esc/Enter/q.
   Leaderboard,
+  /// Soft, recoverable advisory modal — drawn over the workspace and
+  /// dismissed with any key. Used for lock gating, manifest drift, and
+  /// other "you can fix this in-place" cases.
+  Notice,
   Error,
 }
 
@@ -208,6 +212,9 @@ pub struct App {
   working_msg: String,
 
   error_msg: String,
+  /// Body of the active Notice modal (title + message). Cleared on dismiss.
+  notice_title: String,
+  notice_msg: String,
 
   /// Wall-clock instant when the current quest session began (last
   /// enter_workspace for this slug). `None` while we are outside a quest
@@ -304,6 +311,8 @@ impl App {
       tick_count: 0,
       working_msg: String::new(),
       error_msg: String::new(),
+      notice_title: String::new(),
+      notice_msg: String::new(),
       quest_session_start: None,
       session_flushed_secs: 0,
       session_baseline_secs: 0,
@@ -323,10 +332,25 @@ impl App {
   /// Single point that flushes any unrecorded session time, terminates the
   /// fail-state machinery, and lands the app on the Error screen. Used by
   /// every error path so we never leave seconds unrecorded.
+  ///
+  /// Reserve `fail` for FATAL conditions that should end the session
+  /// (config-load failure, missing branch, IO error). For recoverable
+  /// advisories the user can fix without restarting (lock gate, manifest
+  /// drift, hint-already-used), use `notice` instead — it overlays the
+  /// workspace and dismisses on any key.
   fn fail(&mut self, msg: impl Into<String>) {
     flush_session_timer(self);
     self.error_msg = msg.into();
     self.phase = Phase::Error;
+  }
+
+  /// Pop a soft, dismissable advisory on top of the workspace. Does NOT
+  /// flush the session timer (the user is still actively working — they
+  /// just hit a guard rail).
+  fn notice(&mut self, title: impl Into<String>, msg: impl Into<String>) {
+    self.notice_title = title.into();
+    self.notice_msg = msg.into();
+    self.phase = Phase::Notice;
   }
 
   fn hints_for(&self, slug: &str) -> u32 {
@@ -439,8 +463,18 @@ async fn handle_event(app: &mut App, event: Event) -> AdventResult<bool> {
     Phase::Celebrate => celebrate_keys(app, key).await,
     Phase::Complete => Ok(matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q'))),
     Phase::Leaderboard => leaderboard_keys(app, key),
+    Phase::Notice => notice_keys(app, key),
     Phase::Error => Ok(true),
   }
+}
+
+fn notice_keys(app: &mut App, _key: KeyEvent) -> AdventResult<bool> {
+  // Any key dismisses — drop back into the workspace if one is alive,
+  // otherwise fall through to the briefing (early-launch case).
+  app.notice_title.clear();
+  app.notice_msg.clear();
+  app.phase = if app.workspace.is_some() { Phase::Workspace } else { Phase::Briefing };
+  Ok(false)
 }
 
 fn leaderboard_keys(app: &mut App, key: KeyEvent) -> AdventResult<bool> {
@@ -840,7 +874,13 @@ async fn transition_to_quest(app: &mut App, target_slug: String, intent: Pending
       .prev_before(&target.slug)
       .map(|p| format!("{:02} ({})", p.number, p.title))
       .unwrap_or_else(|| "the previous quest".into());
-    app.fail(format!("🔒 Quest {:02} — {} is locked. Complete quest {} first.", target.number, target.title, prev_label));
+    // Soft advisory — the user just bumped the unlock gate. Keep them in
+    // the workspace; they should finish the current quest then `<leader>
+    // n` to advance naturally.
+    app.notice(
+      "Locked",
+      format!("🔒 Quest {:02} — {} is locked.\n\nComplete quest {} first, then run `<leader> n` from there to advance.", target.number, target.title, prev_label),
+    );
     return Ok(());
   }
 
@@ -932,11 +972,14 @@ fn validate_and_celebrate(app: &mut App) -> AdventResult<()> {
       .verify_chapter(&app.cfg.repo_root, &app.quest.slug)
       .map_err(|e| AdventError::ConfigParse(format!("manifest verify failed: {e}")))?;
     if !drift.is_empty() {
-      app.fail(format!(
-        "🛑 test file integrity check failed for {} file(s):\n  {}\n\nRestore the originals with `git checkout HEAD -- <path>` or regenerate the manifest with `duck-advent manifest gen` if the change was intentional.",
-        drift.len(),
-        drift.join("\n  ")
-      ));
+      app.notice(
+        "Test file changed",
+        format!(
+          "🛑 {} test file(s) drifted from the integrity manifest:\n  {}\n\nRestore originals: `git checkout HEAD -- <path>`\nOr regenerate the manifest if the change was intentional: `duck-advent manifest gen`",
+          drift.len(),
+          drift.join("\n  ")
+        ),
+      );
       return Ok(());
     }
   }
@@ -1338,7 +1381,42 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         (app.cfg.config.quests.len(), total_hints, total_dur),
       );
     },
-    Phase::Error => screens::error::draw(frame, area, &app.error_msg),
+    Phase::Notice => {
+      if let Some(ws) = app.workspace.as_ref() {
+        let hints = app.hints_for(&app.quest.slug);
+        ws.draw(
+          frame,
+          area,
+          &crate::workspace::WorkspaceView {
+            quest: &app.quest,
+            total: app.cfg.config.quests.len(),
+            hints_used: hints,
+            leader_pending: app.leader_pending,
+            elapsed_secs: app.quest_elapsed_secs(),
+          },
+        );
+      }
+      screens::notice::draw(frame, area, &app.notice_title, &app.notice_msg);
+    },
+    Phase::Error => {
+      // Even fatal errors should keep the workspace visible underneath so
+      // the user has context for what was on screen when things broke.
+      if let Some(ws) = app.workspace.as_ref() {
+        let hints = app.hints_for(&app.quest.slug);
+        ws.draw(
+          frame,
+          area,
+          &crate::workspace::WorkspaceView {
+            quest: &app.quest,
+            total: app.cfg.config.quests.len(),
+            hints_used: hints,
+            leader_pending: app.leader_pending,
+            elapsed_secs: app.quest_elapsed_secs(),
+          },
+        );
+      }
+      screens::error::draw(frame, area, &app.error_msg);
+    },
   }
 }
 

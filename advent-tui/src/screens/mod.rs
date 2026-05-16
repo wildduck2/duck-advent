@@ -6,6 +6,7 @@ pub mod error;
 pub mod hint;
 pub mod install;
 pub mod leaderboard;
+pub mod notice;
 pub mod running;
 pub mod splash;
 pub mod validators;
