@@ -16,8 +16,23 @@ use std::{
   path::{Path, PathBuf},
 };
 
+/// Process-wide root override. Production keeps it `None` so `root()` resolves
+/// to `~/.gentleduck`. Tests call `set_root_override` to redirect every cache
+/// read/write into a tempdir, leaving the user's real state untouched.
+static ROOT_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// Redirect every subsequent cache call into `root` (typically a tempdir).
+/// Pass `None` to clear and fall back to `$HOME/.gentleduck`. Intended only
+/// for tests — the lock is global so concurrent tests must serialize on it.
+pub fn set_root_override(root: Option<PathBuf>) {
+  *ROOT_OVERRIDE.write().expect("ROOT_OVERRIDE poisoned") = root;
+}
+
 /// Root of the user-global cache. Created on demand.
 pub fn root() -> AdventResult<PathBuf> {
+  if let Some(p) = ROOT_OVERRIDE.read().expect("ROOT_OVERRIDE poisoned").as_ref() {
+    return Ok(p.clone());
+  }
   let home =
     dirs::home_dir().ok_or_else(|| AdventError::ConfigParse("cannot resolve $HOME for ~/.gentleduck cache".into()))?;
   Ok(home.join(".gentleduck"))
@@ -174,36 +189,34 @@ pub fn complete_quest(repo_hash: &str, slug: &str) -> AdventResult<ProgressState
   Ok(state)
 }
 
-pub fn bump_hints(repo_hash: &str, slug: &str) -> AdventResult<u32> {
+/// Increment the per-quest hint counter. Returns the full ProgressState so
+/// the caller can refresh its in-memory snapshot in one disk hit.
+pub fn bump_hints(repo_hash: &str, slug: &str) -> AdventResult<ProgressState> {
   let mut state = read_progress(repo_hash)?;
-  let q = state.ensure_quest(slug);
-  q.hints_used += 1;
-  let used = q.hints_used;
+  state.ensure_quest(slug).hints_used += 1;
   write_progress(repo_hash, &mut state)?;
-  Ok(used)
+  Ok(state)
 }
 
-pub fn bump_attempts(repo_hash: &str, slug: &str) -> AdventResult<u32> {
+/// Increment the per-quest attempt counter (one per `<leader> n` invocation).
+pub fn bump_attempts(repo_hash: &str, slug: &str) -> AdventResult<ProgressState> {
   let mut state = read_progress(repo_hash)?;
-  let q = state.ensure_quest(slug);
-  q.attempts += 1;
-  let n = q.attempts;
+  state.ensure_quest(slug).attempts += 1;
   write_progress(repo_hash, &mut state)?;
-  Ok(n)
+  Ok(state)
 }
 
-/// Add `secs` to the per-quest elapsed timer and persist. Returns the new
-/// total. Called on a periodic tick from the TUI so the timer survives
-/// SIGKILL / lid-close with at most a few seconds of drift.
-pub fn add_elapsed(repo_hash: &str, slug: &str, secs: u64) -> AdventResult<u64> {
+/// Add `secs` to the per-quest elapsed timer and persist. Called on a periodic
+/// tick from the TUI so the timer survives SIGKILL / lid-close with at most a
+/// few seconds of drift. Returns the full ProgressState so the TUI can avoid
+/// a follow-up read.
+pub fn add_elapsed(repo_hash: &str, slug: &str, secs: u64) -> AdventResult<ProgressState> {
+  let mut state = read_progress(repo_hash)?;
   if secs == 0 {
-    let state = read_progress(repo_hash)?;
-    return Ok(state.quests.get(slug).map(|q| q.elapsed_seconds).unwrap_or(0));
+    return Ok(state);
   }
-  let mut state = read_progress(repo_hash)?;
   let q = state.ensure_quest(slug);
   q.elapsed_seconds = q.elapsed_seconds.saturating_add(secs);
-  let total = q.elapsed_seconds;
   write_progress(repo_hash, &mut state)?;
-  Ok(total)
+  Ok(state)
 }
