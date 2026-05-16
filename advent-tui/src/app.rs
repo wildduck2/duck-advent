@@ -1057,9 +1057,24 @@ async fn on_tests_finished(app: &mut App, outcome: TestOutcome) -> AdventResult<
     return Ok(());
   }
   if !outcome.passed {
+    // Tests failed — recoverable, the user fixes their code and re-runs.
+    // Show the last ~10 lines of combined output so they can see the assertion
+    // failure inline without the full vitest spam swallowing the modal.
     let combined: Vec<String> = outcome.stdout.lines().chain(outcome.stderr.lines()).map(str::to_string).collect();
-    let tail = combined.iter().rev().take(20).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-    app.fail(format!("tests failed:\n{tail}"));
+    let tail = combined
+      .iter()
+      .rev()
+      .take(10)
+      .cloned()
+      .collect::<Vec<_>>()
+      .into_iter()
+      .rev()
+      .collect::<Vec<_>>()
+      .join("\n");
+    app.notice(
+      "Tests failed",
+      format!("✗ Some tests didn't pass.\n\nLast output:\n{tail}\n\nFix the code in the editor pane, then press <leader> n to re-run."),
+    );
     return Ok(());
   }
   // Tests passed. Flush any final session seconds BEFORE complete_quest
