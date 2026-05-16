@@ -1,5 +1,29 @@
-//! Finite-state TUI driver. Phase transitions are explicit; all I/O happens
-//! through awaited helpers so the render loop never blocks.
+//! Finite-state TUI driver.
+//!
+//! State management invariants (read before touching):
+//!
+//! 1. `app.progress` mirrors `~/.gentleduck/state/<repo>/progress.json` at all
+//!    times. Every cache mutator (set_current_quest, complete_quest,
+//!    bump_hints, bump_attempts, add_elapsed) returns the freshly written
+//!    ProgressState; all call sites must replace `app.progress` with it.
+//!
+//! 2. The per-quest timer flushes through `flush_session_timer`. That helper
+//!    is idempotent and cheap, so we flush it at *every* boundary that might
+//!    end a session (quest switch, repeat, quit, fail, complete, test pass).
+//!    The periodic 5s tick is the safety net, not the primary mechanism.
+//!
+//! 3. Quest transitions go through ONE entry point: `transition_to_quest`.
+//!    Direct calls to `git::checkout` or `enter_workspace` from action
+//!    handlers are forbidden. The single funnel guarantees: dirty-tree
+//!    handling, branch existence check, timer flush, workspace respawn,
+//!    progress refresh, session reseed — all happen, in the right order,
+//!    every time.
+//!
+//! 4. When a transition cannot complete because the working tree is dirty,
+//!    the user's *intent* is preserved in `pending_intent` so the
+//!    DirtyPrompt resolution replays the exact action they asked for. Prior
+//!    to this, every dirty resolution fell through to `advance_quest` which
+//!    silently converted a backward `<leader> [` into a forward jump.
 
 use std::{
   path::PathBuf,
@@ -52,6 +76,58 @@ enum DirtyChoice {
   Commit,
   Stash,
   Discard,
+}
+
+/// The action that triggered DirtyPrompt — replayed after the user picks a
+/// resolution. Without this, every dirty resolution used to fall through to
+/// `advance_quest`, silently converting backward jumps into forward ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingIntent {
+  /// Validate-and-advance (the `<leader> n` happy path, or Enter on the
+  /// celebrate screen). Goes to the next quest after the current one.
+  AdvanceNext,
+  /// Jump to a specific quest by slug. Used by `<leader> [` and `<leader> ]`.
+  GotoQuest(String),
+  /// Discard edits in the current quest's workdir and re-enter the same
+  /// quest. Used by `<leader> r` and the celebrate-screen `r`.
+  Repeat,
+}
+
+/// Pure mapping from a leader-armed keystroke to the action the user means.
+/// Kept side-effect-free so it can be unit-tested without ratatui/pty/git.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeaderAction {
+  ValidateNext,
+  Repeat,
+  ToggleFocus,
+  ToggleZoom,
+  Hint,
+  Briefing,
+  Quit,
+  PrevQuest,
+  NextQuestNoValidate,
+  /// Explicit cancel — `c`/`C`/`Esc`. Clears the leader without firing.
+  Cancel,
+  /// Any other key — leader prefix is consumed but nothing fires.
+  Unknown,
+}
+
+/// Build a [`LeaderAction`] from the keystroke that followed the leader
+/// prefix. No side effects, no allocation, no I/O. Pure mapping table.
+pub fn leader_action_for(key: KeyCode) -> LeaderAction {
+  match key {
+    KeyCode::Char('n' | 'N') => LeaderAction::ValidateNext,
+    KeyCode::Char('r' | 'R') => LeaderAction::Repeat,
+    KeyCode::Char('b' | 'B') => LeaderAction::ToggleFocus,
+    KeyCode::Char('z' | 'Z') => LeaderAction::ToggleZoom,
+    KeyCode::Char('h' | 'H') => LeaderAction::Hint,
+    KeyCode::Char('p' | 'P') => LeaderAction::Briefing,
+    KeyCode::Char('q' | 'Q') => LeaderAction::Quit,
+    KeyCode::Char('[') => LeaderAction::PrevQuest,
+    KeyCode::Char(']') => LeaderAction::NextQuestNoValidate,
+    KeyCode::Char('c' | 'C') | KeyCode::Esc => LeaderAction::Cancel,
+    _ => LeaderAction::Unknown,
+  }
 }
 
 pub struct App {
@@ -118,6 +194,11 @@ pub struct App {
   /// so the live timer = `session_baseline + session_start.elapsed()` without
   /// hitting disk on every render.
   session_baseline_secs: u64,
+
+  /// What the user *wanted* to do when DirtyPrompt fired. Replayed by
+  /// `apply_dirty_choice` after the working tree is cleaned. Cleared on
+  /// resolution OR cancel so a stale intent never fires later.
+  pending_intent: Option<PendingIntent>,
 }
 
 pub async fn run(cfg: LoadedConfig, cli_version: String) -> AdventResult<()> {
@@ -178,6 +259,7 @@ impl App {
       quest_session_start: None,
       session_flushed_secs: 0,
       session_baseline_secs: 0,
+      pending_intent: None,
     })
   }
 
@@ -188,7 +270,11 @@ impl App {
     self.session_baseline_secs.saturating_add(session)
   }
 
+  /// Single point that flushes any unrecorded session time, terminates the
+  /// fail-state machinery, and lands the app on the Error screen. Used by
+  /// every error path so we never leave seconds unrecorded.
   fn fail(&mut self, msg: impl Into<String>) {
+    flush_session_timer(self);
     self.error_msg = msg.into();
     self.phase = Phase::Error;
   }
@@ -235,7 +321,9 @@ async fn on_tick(app: &mut App) -> AdventResult<()> {
     app.confetti.tick();
   }
   // Flush the per-quest timer to disk every ~5 s so a SIGKILL only loses a
-  // handful of seconds. Tick is 40 ms, so 125 ticks ≈ 5 s.
+  // handful of seconds. Tick is 40 ms, so 125 ticks ≈ 5 s. This is the
+  // safety net — every transition handler also flushes explicitly so a
+  // crash between ticks still records most of the session.
   if app.tick_count.is_multiple_of(125) {
     flush_session_timer(app);
   }
@@ -284,8 +372,9 @@ async fn handle_event(app: &mut App, event: Event) -> AdventResult<bool> {
     return Ok(false);
   }
 
-  // Global quit shortcut.
+  // Global quit shortcut. Flush before bailing so the final seconds count.
   if matches!(key.code, KeyCode::Char('q' | 'Q')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+    flush_session_timer(app);
     return Ok(true);
   }
 
@@ -316,7 +405,9 @@ async fn dirty_prompt_keys(app: &mut App, key: KeyEvent) -> AdventResult<bool> {
     KeyCode::Char('s' | 'S') => apply_dirty_choice(app, DirtyChoice::Stash).await?,
     KeyCode::Char('d' | 'D') => apply_dirty_choice(app, DirtyChoice::Discard).await?,
     KeyCode::Esc | KeyCode::Char('x' | 'X') => {
-      // Cancel — drop back into the workspace; user can keep editing.
+      // Cancel — drop back into the workspace; user can keep editing. Clear
+      // the stashed intent so it cannot fire later.
+      app.pending_intent = None;
       app.phase = Phase::Workspace;
     },
     _ => {},
@@ -344,7 +435,10 @@ async fn briefing_keys(app: &mut App, key: KeyEvent) -> AdventResult<bool> {
       if app.workspace.is_some() {
         app.phase = Phase::Workspace;
       } else {
-        enter_workspace(app).await?;
+        // First entry into the current quest. Funnel through the same single
+        // transition path used by every other quest change.
+        let slug = app.quest.slug.clone();
+        transition_to_quest(app, slug, PendingIntent::GotoQuest(app.quest.slug.clone())).await?;
       }
     },
     KeyCode::Char('j') | KeyCode::Down => app.briefing_scroll = app.briefing_scroll.saturating_add(1),
@@ -363,20 +457,20 @@ async fn workspace_keys(app: &mut App, key: KeyEvent) -> AdventResult<bool> {
   //    leader. Picked because F-keys never collide with nvim or terminal
   //    multiplexers like tmux/screen.
   if matches!(key.code, KeyCode::F(2)) {
-    if let Some(ws) = app.workspace.as_mut() {
-      if let Err(e) = ws.toggle_focus() {
-        app.fail(format!("pane resize failed: {e}"));
-      }
+    if let Some(ws) = app.workspace.as_mut()
+      && let Err(e) = ws.toggle_focus()
+    {
+      app.fail(format!("pane resize failed: {e}"));
     }
     return Ok(false);
   }
   // F3 — toggle full-screen for the focused pane. Resizes the embedded child
   // immediately so vitest/nvim re-flow to the new width.
   if matches!(key.code, KeyCode::F(3)) {
-    if let Some(ws) = app.workspace.as_mut() {
-      if let Err(e) = ws.toggle_zoom() {
-        app.fail(format!("zoom resize failed: {e}"));
-      }
+    if let Some(ws) = app.workspace.as_mut()
+      && let Err(e) = ws.toggle_zoom()
+    {
+      app.fail(format!("zoom resize failed: {e}"));
     }
     return Ok(false);
   }
@@ -387,7 +481,7 @@ async fn workspace_keys(app: &mut App, key: KeyEvent) -> AdventResult<bool> {
   if app.leader_pending {
     app.leader_pending = false;
     app.leader_deadline = None;
-    return dispatch_leader(app, key).await;
+    return apply_leader_action(app, leader_action_for(key.code)).await;
   }
   let is_leader_trigger = key.modifiers.contains(KeyModifiers::CONTROL)
     && (matches!(key.code, KeyCode::Char('a' | 'A')) || matches!(key.code, KeyCode::Char(' ')));
@@ -401,85 +495,85 @@ async fn workspace_keys(app: &mut App, key: KeyEvent) -> AdventResult<bool> {
     return Ok(false);
   };
 
-  // 2. Tests pane is read-only. Navigation keys scroll the vt100 scrollback;
+  // 3. Tests pane is read-only. Navigation keys scroll the vt100 scrollback;
   //    everything else is silently swallowed (no stdin to vitest).
   if matches!(ws.focus, crate::workspace::Focus::Tests) {
     let _ = handle_tests_scroll(ws, key);
     return Ok(false);
   }
 
-  // 3. Editor pane gets the raw key.
+  // 4. Editor pane gets the raw key.
   if let Err(e) = ws.forward_key(key) {
     app.fail(format!("editor pty closed: {e}"));
   }
   Ok(false)
 }
 
-/// `<leader>` is `Ctrl-a`. Following keystrokes invoke duck commands without
-/// touching nvim/vitest. Single-letter mnemonics — n=next, r=repeat, b=switch
-/// focus, h=hint, p=briefing, q=quit, c=cancel.
-async fn dispatch_leader(app: &mut App, key: KeyEvent) -> AdventResult<bool> {
-  match key.code {
-    KeyCode::Char('n' | 'N') => {
-      validate_and_celebrate(app)?;
-    },
-    KeyCode::Char('r' | 'R') => {
-      repeat_current(app).await?;
-    },
-    KeyCode::Char('b' | 'B') => {
-      if let Some(ws) = app.workspace.as_mut() {
-        if let Err(e) = ws.toggle_focus() {
-          app.fail(format!("pane resize failed: {e}"));
-        }
+/// Run the effect for a `LeaderAction`. The key→action mapping lives in the
+/// pure `leader_action_for`; this function is the impure half. Returns `true`
+/// when the event loop should exit.
+async fn apply_leader_action(app: &mut App, action: LeaderAction) -> AdventResult<bool> {
+  match action {
+    LeaderAction::ValidateNext => validate_and_celebrate(app)?,
+    LeaderAction::Repeat => transition_to_quest(app, app.quest.slug.clone(), PendingIntent::Repeat).await?,
+    LeaderAction::ToggleFocus => {
+      if let Some(ws) = app.workspace.as_mut()
+        && let Err(e) = ws.toggle_focus()
+      {
+        app.fail(format!("pane resize failed: {e}"));
       }
     },
-    KeyCode::Char('z' | 'Z') => {
-      if let Some(ws) = app.workspace.as_mut() {
-        if let Err(e) = ws.toggle_zoom() {
-          app.fail(format!("zoom resize failed: {e}"));
-        }
+    LeaderAction::ToggleZoom => {
+      if let Some(ws) = app.workspace.as_mut()
+        && let Err(e) = ws.toggle_zoom()
+      {
+        app.fail(format!("zoom resize failed: {e}"));
       }
     },
-    KeyCode::Char('h' | 'H') => {
-      let used = app.hints_for(&app.quest.slug) as usize;
-      let total = app.quest.hints.len();
-      if total == 0 {
-        app.hint_text = "this quest has no hints — you're on your own".into();
-        app.hint_index = 0;
-      } else if used >= total {
-        app.hint_text = format!("you've used all {total} hints — re-read the briefing with <leader> p");
-        app.hint_index = total.saturating_sub(1);
-      } else {
-        app.hint_text = app.quest.hints[used].clone();
-        app.hint_index = used;
-        let _ = bump_hints(&app.cfg.repo_hash, &app.quest.slug);
-        app.progress = read_progress(&app.cfg.repo_hash)?;
-      }
-      app.phase = Phase::HintOverlay;
-    },
-    KeyCode::Char('p' | 'P') => {
+    LeaderAction::Hint => show_hint(app)?,
+    LeaderAction::Briefing => {
       load_briefing(app).await?;
       app.phase = Phase::Briefing;
     },
-    KeyCode::Char('q' | 'Q') => return Ok(true),
-    // `[` / `]` — non-destructive quest navigation. No validation, just jump.
-    // Mirrors vim's `[`/`]` motions. Dirty tree pops the same prompt the
-    // forward path uses.
-    KeyCode::Char('[') => {
+    LeaderAction::Quit => {
+      flush_session_timer(app);
+      return Ok(true);
+    },
+    LeaderAction::PrevQuest => {
       if let Some(prev) = app.cfg.config.prev_before(&app.quest.slug).cloned() {
-        goto_quest(app, prev.slug).await?;
+        transition_to_quest(app, prev.slug.clone(), PendingIntent::GotoQuest(prev.slug)).await?;
       }
     },
-    KeyCode::Char(']') => {
+    LeaderAction::NextQuestNoValidate => {
       if let Some(next) = app.cfg.config.next_after(&app.quest.slug).cloned() {
-        goto_quest(app, next.slug).await?;
+        transition_to_quest(app, next.slug.clone(), PendingIntent::GotoQuest(next.slug)).await?;
       }
     },
-    // c / Esc / Ctrl-a again = cancel the leader without firing a command.
-    KeyCode::Char('c' | 'C') | KeyCode::Esc => {},
-    _ => {},
+    LeaderAction::Cancel | LeaderAction::Unknown => {},
   }
   Ok(false)
+}
+
+/// Bump the hint counter, refresh `app.progress` with the post-write state,
+/// and stage the hint overlay text.
+fn show_hint(app: &mut App) -> AdventResult<()> {
+  let used = app.hints_for(&app.quest.slug) as usize;
+  let total = app.quest.hints.len();
+  if total == 0 {
+    app.hint_text = "this quest has no hints — you're on your own".into();
+    app.hint_index = 0;
+  } else if used >= total {
+    app.hint_text = format!("you've used all {total} hints — re-read the briefing with <leader> p");
+    app.hint_index = total.saturating_sub(1);
+  } else {
+    app.hint_text = app.quest.hints[used].clone();
+    app.hint_index = used;
+    // bump_hints returns the post-write ProgressState — keep our snapshot
+    // synchronized with disk in one round-trip.
+    app.progress = bump_hints(&app.cfg.repo_hash, &app.quest.slug)?;
+  }
+  app.phase = Phase::HintOverlay;
+  Ok(())
 }
 
 /// Returns true when the key was consumed by scrolling. Read-only — does
@@ -532,11 +626,14 @@ fn hint_keys(app: &mut App, key: KeyEvent) -> AdventResult<bool> {
 
 async fn celebrate_keys(app: &mut App, key: KeyEvent) -> AdventResult<bool> {
   match key.code {
-    KeyCode::Char('n' | 'N') | KeyCode::Enter => advance_quest(app).await?,
+    KeyCode::Char('n' | 'N') | KeyCode::Enter => advance_after_completion(app).await?,
     KeyCode::Char('r' | 'R') => {
-      repeat_current(app).await?;
+      transition_to_quest(app, app.quest.slug.clone(), PendingIntent::Repeat).await?
     },
-    KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+    KeyCode::Char('q') | KeyCode::Esc => {
+      flush_session_timer(app);
+      return Ok(true);
+    },
     _ => {},
   }
   Ok(false)
@@ -638,40 +735,87 @@ async fn load_briefing(app: &mut App) -> AdventResult<()> {
   Ok(())
 }
 
-/// Idempotent workspace entry. If a Workspace is already alive on the right
-/// branch we just flip the phase — never respawn nvim/vitest needlessly. Only
-/// spawns fresh when there's no workspace yet or the user is on a different
-/// branch than the active quest.
-async fn enter_workspace(app: &mut App) -> AdventResult<()> {
+/// Single entry point for every quest change. Handles, in order:
+///   1. Validate the target slug exists in config.
+///   2. Verify the branch exists in git (fail-fast — no dirty-prompt
+///      detour for nonexistent branches like the previous code did).
+///   3. If staying on the same quest AND the same branch is already checked
+///      out, short-circuit cheaply: discard workdir if this is a Repeat,
+///      otherwise just re-enter the workspace.
+///   4. If we need to switch branches and the working tree is dirty, stash
+///      the [`PendingIntent`] so the dirty-prompt resolution replays this
+///      exact action — never converts a backward jump into a forward one.
+///   5. Flush the in-flight timer (so we never rob the user of seconds at a
+///      transition), kill the old workspace, checkout, refresh progress,
+///      respawn the workspace, reseed the session clock.
+async fn transition_to_quest(app: &mut App, target_slug: String, intent: PendingIntent) -> AdventResult<()> {
   use advent_quest::git;
+  // (1) Resolve the target quest from config — invalid slugs fail loud.
+  let Some(target) = app.cfg.config.find_by_slug(&target_slug).cloned() else {
+    app.fail(format!("quest {target_slug} not in config"));
+    return Ok(());
+  };
 
-  let current = git::current_branch(&app.cfg.repo_root).await?;
-  let needs_checkout = current != app.quest.slug;
-
-  if needs_checkout {
-    if !git::working_tree_clean(&app.cfg.repo_root).await? {
-      app.phase = Phase::DirtyPrompt;
-      return Ok(());
-    }
-    if !git::branch_exists(&app.cfg.repo_root, &app.quest.slug).await? {
-      app.fail(format!("branch \"{}\" does not exist", app.quest.slug));
-      return Ok(());
-    }
-    git::checkout(&app.cfg.repo_root, &app.quest.slug).await?;
-  }
-  app.progress = set_current_quest(&app.cfg.repo_hash, &app.quest.slug)?;
-
-  // Re-use existing workspace when we did not change branches. Saves nvim
-  // restart + preserves user's open buffers, cursor position, undo history.
-  if !needs_checkout && app.workspace.is_some() {
-    app.phase = Phase::Workspace;
+  // (2) Branch existence — check BEFORE dirty-prompt. A missing branch is a
+  // config/repo bug; popping a dirty prompt for it would be misleading.
+  let current_branch = git::current_branch(&app.cfg.repo_root).await?;
+  let needs_checkout = current_branch != target.slug;
+  if needs_checkout && !git::branch_exists(&app.cfg.repo_root, &target.slug).await? {
+    app.fail(format!("branch \"{}\" does not exist", target.slug));
     return Ok(());
   }
 
+  // (3) Same-quest fast path. Repeat discards the workdir; everything else
+  // just flips back into the existing workspace (preserves nvim buffers).
+  if !needs_checkout && app.workspace.is_some() && app.quest.slug == target.slug {
+    match intent {
+      PendingIntent::Repeat => {
+        flush_session_timer(app);
+        if let Some(ws) = app.workspace.as_mut() {
+          ws.editor.kill();
+          ws.tests.kill();
+        }
+        app.workspace = None;
+        git::discard_workdir(&app.cfg.repo_root, &target.workdir).await?;
+        spawn_workspace(app, target).await?;
+      },
+      _ => {
+        app.phase = Phase::Workspace;
+      },
+    }
+    app.pending_intent = None;
+    return Ok(());
+  }
+
+  // (4) Dirty-tree guard — only when actually switching branches. Stash the
+  // intent so the resolution path knows what to replay.
+  if needs_checkout && !git::working_tree_clean(&app.cfg.repo_root).await? {
+    app.pending_intent = Some(intent);
+    app.phase = Phase::DirtyPrompt;
+    return Ok(());
+  }
+
+  // (5) The happy path — flush, checkout, refresh, respawn, reseed.
+  flush_session_timer(app);
+  if needs_checkout {
+    git::checkout(&app.cfg.repo_root, &target.slug).await?;
+  }
+  app.progress = set_current_quest(&app.cfg.repo_hash, &target.slug)?;
+  app.quest = target.clone();
+  load_briefing(app).await?;
+  spawn_workspace(app, target).await?;
+  app.pending_intent = None;
+  Ok(())
+}
+
+/// Kill any existing workspace, spawn a fresh one for `quest`, reseed the
+/// session timer from the persisted baseline. Used only by
+/// `transition_to_quest`; not a public entry point.
+async fn spawn_workspace(app: &mut App, quest: QuestStep) -> AdventResult<()> {
   drop(app.workspace.take());
   let (cols, rows) = crossterm::terminal::size().map_err(AdventError::BareIo)?;
   let area = Rect { x: 0, y: 0, width: cols, height: rows };
-  let ws = Workspace::spawn(&app.cfg.repo_root, &app.cfg.config, &app.quest, area)
+  let ws = Workspace::spawn(&app.cfg.repo_root, &app.cfg.config, &quest, area)
     .map_err(|e| AdventError::Git(e.to_string()))?;
   app.workspace = Some(ws);
   begin_quest_session(app);
@@ -683,7 +827,10 @@ async fn enter_workspace(app: &mut App) -> AdventResult<()> {
 /// so the UI stays responsive while vitest churns. Live stdout/stderr lines
 /// stream into `test_lines_rx` so the modal can render the tail.
 fn validate_and_celebrate(app: &mut App) -> AdventResult<()> {
-  let _ = bump_attempts(&app.cfg.repo_hash, &app.quest.slug)?;
+  // bump_attempts now returns the full ProgressState — keep our snapshot in
+  // sync with disk so the attempt count rendered on the celebrate screen
+  // reflects this run, not the previous one.
+  app.progress = bump_attempts(&app.cfg.repo_hash, &app.quest.slug)?;
   let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
   let (done_tx, done_rx) = oneshot::channel();
   let cancel = std::sync::Arc::new(tokio::sync::Mutex::new(false));
@@ -720,6 +867,10 @@ async fn on_tests_finished(app: &mut App, outcome: TestOutcome) -> AdventResult<
     app.fail(format!("tests failed:\n{tail}"));
     return Ok(());
   }
+  // Tests passed. Flush any final session seconds BEFORE complete_quest writes
+  // so the celebrate screen reflects the full active time, not just what the
+  // last periodic tick captured.
+  flush_session_timer(app);
   app.progress = complete_quest(&app.cfg.repo_hash, &app.quest.slug)?;
   app.is_last_quest = app.cfg.config.next_after(&app.quest.slug).is_none();
   app.celebrate_secs = duration_for(&app.progress, &app.quest.slug);
@@ -727,25 +878,21 @@ async fn on_tests_finished(app: &mut App, outcome: TestOutcome) -> AdventResult<
   Ok(())
 }
 
-async fn advance_quest(app: &mut App) -> AdventResult<()> {
+/// `Enter` / `n` on the celebrate screen. Walks to the next quest or lands
+/// on Complete when there is no next.
+async fn advance_after_completion(app: &mut App) -> AdventResult<()> {
   let Some(next) = app.cfg.config.next_after(&app.quest.slug).cloned() else {
+    flush_session_timer(app);
     app.phase = Phase::Complete;
     return Ok(());
   };
-  // If the user has uncommitted edits we can't blindly `git checkout` away.
-  // Pop a DirtyPrompt modal asking what to do instead of panicking.
-  if !advent_quest::git::working_tree_clean(&app.cfg.repo_root).await? {
-    app.phase = Phase::DirtyPrompt;
-    return Ok(());
-  }
-  flush_session_timer(app);
-  drop(app.workspace.take());
-  app.quest = next;
-  load_briefing(app).await?;
-  enter_workspace(app).await?;
-  Ok(())
+  transition_to_quest(app, next.slug.clone(), PendingIntent::AdvanceNext).await
 }
 
+/// Apply the user's dirty-tree choice, then replay whatever intent triggered
+/// the prompt. Previously this hard-coded `advance_quest`; now it honours
+/// the intent so backward jumps and repeats don't silently become forward
+/// advances.
 async fn apply_dirty_choice(app: &mut App, choice: DirtyChoice) -> AdventResult<()> {
   let workdir = app.quest.workdir.clone();
   let repo = app.cfg.repo_root.clone();
@@ -759,7 +906,7 @@ async fn apply_dirty_choice(app: &mut App, choice: DirtyChoice) -> AdventResult<
       // outside the quest's workdir remain unstaged.
       run_git(&repo, &["add", "-A"]).await?;
       // `--allow-empty` so `c` succeeds even if every change was inside an
-      // ignored path. `-n` skips pre-commit hooks that would block the flow.
+      // ignored path. `--no-verify` skips pre-commit hooks that would block.
       ensure_git_identity(&repo).await?;
       run_git(&repo, &["commit", "-m", &msg, "--allow-empty", "--no-verify"]).await?;
     },
@@ -770,8 +917,29 @@ async fn apply_dirty_choice(app: &mut App, choice: DirtyChoice) -> AdventResult<
       advent_quest::git::discard_workdir(&repo, &workdir).await?;
     },
   }
-  // After the cleanup, re-attempt the advance — this time the tree is clean.
-  advance_quest(app).await
+  // Replay the original intent against the cleaned working tree. If the
+  // intent was lost (shouldn't happen, but defensive), fall back to advancing
+  // forward so the user is never stuck on the Working screen.
+  let intent = app.pending_intent.take().unwrap_or(PendingIntent::AdvanceNext);
+  replay_intent(app, intent).await
+}
+
+async fn replay_intent(app: &mut App, intent: PendingIntent) -> AdventResult<()> {
+  match intent {
+    PendingIntent::AdvanceNext => {
+      let next = app.cfg.config.next_after(&app.quest.slug).cloned();
+      match next {
+        Some(n) => transition_to_quest(app, n.slug.clone(), PendingIntent::AdvanceNext).await,
+        None => {
+          flush_session_timer(app);
+          app.phase = Phase::Complete;
+          Ok(())
+        },
+      }
+    },
+    PendingIntent::GotoQuest(slug) => transition_to_quest(app, slug.clone(), PendingIntent::GotoQuest(slug)).await,
+    PendingIntent::Repeat => transition_to_quest(app, app.quest.slug.clone(), PendingIntent::Repeat).await,
+  }
 }
 
 async fn run_git(cwd: &std::path::Path, args: &[&str]) -> AdventResult<()> {
@@ -802,7 +970,8 @@ async fn ensure_git_identity(cwd: &std::path::Path) -> AdventResult<()> {
 }
 
 /// Persist the unflushed delta of the current quest session and slide the
-/// flush watermark forward. Safe to call when no session is active.
+/// flush watermark forward. Safe (and cheap — no disk IO when delta=0) to
+/// call from any boundary that ends a session.
 fn flush_session_timer(app: &mut App) {
   let Some(started) = app.quest_session_start else {
     return;
@@ -812,11 +981,9 @@ fn flush_session_timer(app: &mut App) {
   if delta == 0 {
     return;
   }
-  if let Ok(total) = add_elapsed(&app.cfg.repo_hash, &app.quest.slug, delta) {
+  if let Ok(state) = add_elapsed(&app.cfg.repo_hash, &app.quest.slug, delta) {
     app.session_flushed_secs = session_secs;
-    if let Some(q) = app.progress.quests.get_mut(&app.quest.slug) {
-      q.elapsed_seconds = total;
-    }
+    app.progress = state;
   }
 }
 
@@ -827,41 +994,6 @@ fn begin_quest_session(app: &mut App) {
   app.session_baseline_secs = app.progress.quests.get(&app.quest.slug).map(|q| q.elapsed_seconds).unwrap_or(0);
   app.session_flushed_secs = 0;
   app.quest_session_start = Some(Instant::now());
-}
-
-/// Switch to a quest by slug without running the validator. Flushes the
-/// in-flight timer so the move never robs the user of recorded time. Used by
-/// the `<leader> [` / `<leader> ]` chords.
-async fn goto_quest(app: &mut App, slug: String) -> AdventResult<()> {
-  let Some(target) = app.cfg.config.find_by_slug(&slug).cloned() else {
-    app.fail(format!("quest {slug} not in config"));
-    return Ok(());
-  };
-  if target.slug == app.quest.slug {
-    return Ok(());
-  }
-  if !advent_quest::git::working_tree_clean(&app.cfg.repo_root).await? {
-    app.phase = Phase::DirtyPrompt;
-    return Ok(());
-  }
-  flush_session_timer(app);
-  drop(app.workspace.take());
-  app.quest = target;
-  load_briefing(app).await?;
-  enter_workspace(app).await?;
-  Ok(())
-}
-
-async fn repeat_current(app: &mut App) -> AdventResult<()> {
-  let workdir = app.quest.workdir.clone();
-  if let Some(ws) = app.workspace.as_mut() {
-    ws.editor.kill();
-    ws.tests.kill();
-  }
-  app.workspace = None;
-  advent_quest::git::discard_workdir(&app.cfg.repo_root, &workdir).await?;
-  enter_workspace(app).await?;
-  Ok(())
 }
 
 fn duration_for(progress: &ProgressState, slug: &str) -> u64 {
@@ -900,27 +1032,67 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
       // pane keep running while they read the briefing.
       if let Some(ws) = app.workspace.as_ref() {
         let hints = app.hints_for(&app.quest.slug);
-        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending, app.quest_elapsed_secs());
+        ws.draw(
+          frame,
+          area,
+          &crate::workspace::WorkspaceView {
+            quest: &app.quest,
+            total: app.cfg.config.quests.len(),
+            hints_used: hints,
+            leader_pending: app.leader_pending,
+            elapsed_secs: app.quest_elapsed_secs(),
+          },
+        );
       }
       screens::briefing::draw(frame, area, &app.quest, &app.briefing_md, app.briefing_scroll);
     },
     Phase::Workspace => {
       if let Some(ws) = app.workspace.as_ref() {
         let hints = app.hints_for(&app.quest.slug);
-        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending, app.quest_elapsed_secs());
+        ws.draw(
+          frame,
+          area,
+          &crate::workspace::WorkspaceView {
+            quest: &app.quest,
+            total: app.cfg.config.quests.len(),
+            hints_used: hints,
+            leader_pending: app.leader_pending,
+            elapsed_secs: app.quest_elapsed_secs(),
+          },
+        );
       }
     },
     Phase::HintOverlay => {
       if let Some(ws) = app.workspace.as_ref() {
         let hints = app.hints_for(&app.quest.slug);
-        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending, app.quest_elapsed_secs());
+        ws.draw(
+          frame,
+          area,
+          &crate::workspace::WorkspaceView {
+            quest: &app.quest,
+            total: app.cfg.config.quests.len(),
+            hints_used: hints,
+            leader_pending: app.leader_pending,
+            elapsed_secs: app.quest_elapsed_secs(),
+          },
+        );
       }
       screens::hint::draw(frame, area, &app.hint_text, app.hint_index, app.quest.hints.len());
     },
     Phase::RunningTests => {
       if let Some(ws) = app.workspace.as_ref() {
         let hints = app.hints_for(&app.quest.slug);
-        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending, app.quest_elapsed_secs());
+        ws.draw(
+          frame,
+          area,
+          &crate::workspace::WorkspaceView {
+            quest: &app.quest,
+            total: app.cfg.config.quests.len(),
+            hints_used: hints,
+            leader_pending: app.leader_pending,
+            elapsed_secs: app.quest_elapsed_secs(),
+          },
+        );
       }
       let elapsed_ticks = app.tick_count.wrapping_sub(app.test_started_tick);
       let tail: Vec<&str> = app.test_tail.iter().map(String::as_str).collect();
@@ -936,14 +1108,34 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     Phase::DirtyPrompt => {
       if let Some(ws) = app.workspace.as_ref() {
         let hints = app.hints_for(&app.quest.slug);
-        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending, app.quest_elapsed_secs());
+        ws.draw(
+          frame,
+          area,
+          &crate::workspace::WorkspaceView {
+            quest: &app.quest,
+            total: app.cfg.config.quests.len(),
+            hints_used: hints,
+            leader_pending: app.leader_pending,
+            elapsed_secs: app.quest_elapsed_secs(),
+          },
+        );
       }
       screens::dirty::draw(frame, area, &app.quest.title);
     },
     Phase::Working => {
       if let Some(ws) = app.workspace.as_ref() {
         let hints = app.hints_for(&app.quest.slug);
-        ws.draw(frame, area, &app.quest, app.cfg.config.quests.len(), hints, app.leader_pending, app.quest_elapsed_secs());
+        ws.draw(
+          frame,
+          area,
+          &crate::workspace::WorkspaceView {
+            quest: &app.quest,
+            total: app.cfg.config.quests.len(),
+            hints_used: hints,
+            leader_pending: app.leader_pending,
+            elapsed_secs: app.quest_elapsed_secs(),
+          },
+        );
       }
       screens::working::draw(frame, area, &app.working_msg, (app.test_spin & 0xFF) as u8);
     },
@@ -970,5 +1162,94 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
       );
     },
     Phase::Error => screens::error::draw(frame, area, &app.error_msg),
+  }
+}
+
+// ---------- tests --------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+  //! Pure-logic tests only. Anything that touches git, pty, ratatui, the
+  //! filesystem, or `~/.gentleduck` belongs in the integration-test crate
+  //! `advent-cache/tests/` or as an end-to-end harness.
+
+  use super::*;
+
+  #[test]
+  fn leader_action_table_covers_every_documented_chord() {
+    // Lowercase chord set documented in the hint bar.
+    assert_eq!(leader_action_for(KeyCode::Char('n')), LeaderAction::ValidateNext);
+    assert_eq!(leader_action_for(KeyCode::Char('r')), LeaderAction::Repeat);
+    assert_eq!(leader_action_for(KeyCode::Char('b')), LeaderAction::ToggleFocus);
+    assert_eq!(leader_action_for(KeyCode::Char('z')), LeaderAction::ToggleZoom);
+    assert_eq!(leader_action_for(KeyCode::Char('h')), LeaderAction::Hint);
+    assert_eq!(leader_action_for(KeyCode::Char('p')), LeaderAction::Briefing);
+    assert_eq!(leader_action_for(KeyCode::Char('q')), LeaderAction::Quit);
+    assert_eq!(leader_action_for(KeyCode::Char('[')), LeaderAction::PrevQuest);
+    assert_eq!(leader_action_for(KeyCode::Char(']')), LeaderAction::NextQuestNoValidate);
+    assert_eq!(leader_action_for(KeyCode::Char('c')), LeaderAction::Cancel);
+    assert_eq!(leader_action_for(KeyCode::Esc), LeaderAction::Cancel);
+  }
+
+  #[test]
+  fn leader_action_uppercase_aliases_match_lowercase() {
+    for (lower, upper) in [('n', 'N'), ('r', 'R'), ('b', 'B'), ('z', 'Z'), ('h', 'H'), ('p', 'P'), ('q', 'Q'), ('c', 'C')] {
+      assert_eq!(
+        leader_action_for(KeyCode::Char(lower)),
+        leader_action_for(KeyCode::Char(upper)),
+        "uppercase {upper} should alias to lowercase {lower}"
+      );
+    }
+  }
+
+  #[test]
+  fn leader_action_unknown_for_unbound_keys() {
+    assert_eq!(leader_action_for(KeyCode::Char('x')), LeaderAction::Unknown);
+    assert_eq!(leader_action_for(KeyCode::Tab), LeaderAction::Unknown);
+    assert_eq!(leader_action_for(KeyCode::F(5)), LeaderAction::Unknown);
+  }
+
+  #[test]
+  fn duration_for_prefers_elapsed_seconds() {
+    use chrono::{Duration as ChronoDuration, Utc};
+    let mut state = ProgressState::empty();
+    let q = state.ensure_quest("slug");
+    q.elapsed_seconds = 42;
+    q.started_at = Some(Utc::now() - ChronoDuration::seconds(9999));
+    q.completed_at = Some(Utc::now());
+    // elapsed_seconds wins over the wall-clock fallback.
+    assert_eq!(duration_for(&state, "slug"), 42);
+  }
+
+  #[test]
+  fn duration_for_falls_back_to_wallclock_when_elapsed_zero() {
+    use chrono::{Duration as ChronoDuration, Utc};
+    let mut state = ProgressState::empty();
+    let now = Utc::now();
+    let q = state.ensure_quest("slug");
+    q.elapsed_seconds = 0;
+    q.started_at = Some(now - ChronoDuration::seconds(120));
+    q.completed_at = Some(now);
+    let secs = duration_for(&state, "slug");
+    // Allow 2s slack — Utc::now() is called twice across the helper.
+    assert!((118..=122).contains(&secs), "expected ~120s, got {secs}");
+  }
+
+  #[test]
+  fn duration_for_returns_zero_when_quest_absent() {
+    let state = ProgressState::empty();
+    assert_eq!(duration_for(&state, "nonexistent"), 0);
+  }
+
+  #[test]
+  fn pending_intent_round_trips_through_clone() {
+    let intents = [
+      PendingIntent::AdvanceNext,
+      PendingIntent::GotoQuest("chapter-03".into()),
+      PendingIntent::Repeat,
+    ];
+    for i in &intents {
+      assert_eq!(i.clone(), *i);
+    }
   }
 }

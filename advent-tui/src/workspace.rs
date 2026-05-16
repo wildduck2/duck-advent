@@ -21,6 +21,17 @@ pub enum Focus {
   Tests,
 }
 
+/// View-model bundle for [`Workspace::draw`]. Folds the seven render
+/// parameters into one struct so callers don't have to thread a long
+/// positional argument list and clippy stops flagging too_many_arguments.
+pub struct WorkspaceView<'a> {
+  pub quest: &'a QuestStep,
+  pub total: usize,
+  pub hints_used: u32,
+  pub leader_pending: bool,
+  pub elapsed_secs: u64,
+}
+
 impl Focus {
   pub fn toggle(self) -> Self {
     match self {
@@ -162,52 +173,34 @@ impl Workspace {
     }
   }
 
-  pub fn draw(
-    &self,
-    frame: &mut Frame<'_>,
-    area: Rect,
-    quest: &QuestStep,
-    total: usize,
-    hints_used: u32,
-    leader_pending: bool,
-    elapsed_secs: u64,
-  ) {
+  pub fn draw(&self, frame: &mut Frame<'_>, area: Rect, view: &WorkspaceView<'_>) {
     let chunks = Layout::default()
       .direction(Direction::Vertical)
       .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
       .split(area);
-    self.draw_status(frame, chunks[0], quest, total, hints_used, leader_pending, elapsed_secs);
+    self.draw_status(frame, chunks[0], view);
     self.draw_panes(frame, chunks[1]);
-    self.draw_hints(frame, chunks[2], leader_pending);
+    self.draw_hints(frame, chunks[2], view.leader_pending);
   }
 
-  fn draw_status(
-    &self,
-    frame: &mut Frame<'_>,
-    area: Rect,
-    quest: &QuestStep,
-    total: usize,
-    hints: u32,
-    leader_pending: bool,
-    elapsed_secs: u64,
-  ) {
+  fn draw_status(&self, frame: &mut Frame<'_>, area: Rect, view: &WorkspaceView<'_>) {
     let mut spans = vec![
       Span::styled("  duck ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
       Span::styled("· ", Style::default().fg(Color::DarkGray)),
       Span::styled(
-        format!("Quest {:02}/{:02}", quest.number, total),
+        format!("Quest {:02}/{:02}", view.quest.number, view.total),
         Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD),
       ),
       Span::raw("  "),
-      Span::styled(&quest.title, Style::default().fg(Color::White)),
+      Span::styled(&view.quest.title, Style::default().fg(Color::White)),
       Span::raw("  "),
-      Span::styled(quest.tier.clone().unwrap_or_default(), Style::default().fg(Color::DarkGray)),
+      Span::styled(view.quest.tier.clone().unwrap_or_default(), Style::default().fg(Color::DarkGray)),
       Span::raw("  · hints "),
-      Span::styled(format!("{}/{}", hints, quest.hints.len()), Style::default().fg(Color::Yellow)),
+      Span::styled(format!("{}/{}", view.hints_used, view.quest.hints.len()), Style::default().fg(Color::Yellow)),
       Span::raw("  · "),
-      Span::styled(format_elapsed(elapsed_secs), Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+      Span::styled(format_elapsed(view.elapsed_secs), Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
     ];
-    if leader_pending {
+    if view.leader_pending {
       spans.push(Span::raw("  "));
       spans.push(Span::styled(
         " LEADER ",
@@ -337,4 +330,37 @@ fn inner_panes_area(area: Rect) -> Rect {
     .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
     .split(area);
   inner[1]
+}
+
+#[cfg(test)]
+mod tests {
+  use super::format_elapsed;
+
+  #[test]
+  fn format_elapsed_under_one_minute() {
+    assert_eq!(format_elapsed(0), "⏱ 00:00");
+    assert_eq!(format_elapsed(7), "⏱ 00:07");
+    assert_eq!(format_elapsed(59), "⏱ 00:59");
+  }
+
+  #[test]
+  fn format_elapsed_minutes_pad_two_digits() {
+    assert_eq!(format_elapsed(60), "⏱ 01:00");
+    assert_eq!(format_elapsed(125), "⏱ 02:05");
+    assert_eq!(format_elapsed(3599), "⏱ 59:59");
+  }
+
+  #[test]
+  fn format_elapsed_switches_to_hour_format_at_one_hour() {
+    assert_eq!(format_elapsed(3600), "⏱ 1:00:00");
+    assert_eq!(format_elapsed(3661), "⏱ 1:01:01");
+    assert_eq!(format_elapsed(7325), "⏱ 2:02:05");
+  }
+
+  #[test]
+  fn format_elapsed_handles_very_large_values() {
+    // 100 hours — should not truncate or panic.
+    let s = format_elapsed(360_000);
+    assert_eq!(s, "⏱ 100:00:00");
+  }
 }
